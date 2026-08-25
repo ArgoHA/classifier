@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+.DS_Store
+
+# Experiment / training outputs
+wandb/
+output/
+
+*.pt
+*.onnx
+*.engine
+*.xml
+*.bin
+
+# Local benchmark record - numbers are machine-specific
+BENCHMARK.md
+config_bench.yaml

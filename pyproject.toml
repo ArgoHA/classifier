@@ -1,0 +1,141 @@
+[project]
+name = "classifier"
+version = "0.1.0"
+description = "Image classification pipeline: timm training, export to ONNX/TensorRT/OpenVINO, and benchmarking"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+authors = [{ name = "Argo Saakyan", email = "argo.cve@gmail.com" }]
+keywords = ["image-classification", "timm", "pytorch", "tensorrt", "openvino", "onnx"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+# Core = torch training + inference. Export backends are opt-in (see optional-dependencies).
+# Upper bounds are the tested major/minor, not paranoia: torch, timm and TensorRT all move
+# the benchmark numbers in BENCHMARK.md, so a silent jump would look like a regression in
+# our own code. Raise a cap deliberately, re-lock, and re-baseline.
+dependencies = [
+    "albumentations>=2.0.8,<3",
+    "hydra-core>=1.3.2,<2",
+    "loguru>=0.7.2",
+    "matplotlib>=3.10.3",
+    "numpy>=2.1.1,<3",
+    "omegaconf>=2.3.0,<3",
+    # Pinned, not floored: 4.14 made small-input INTER_AREA resize ~10% slower, which
+    # is ~4% of the whole single-image TensorRT latency in BENCHMARK.md. Bump only with
+    # a re-baseline.
+    "opencv-python-headless==4.10.0.84",
+    "pandas>=2.2.3",
+    "pillow>=11.1.0",
+    "pyyaml>=6.0.2",
+    "scikit-learn>=1.7.0",
+    "tabulate>=0.9.0",
+    "timm>=1.0.27,<1.1",
+    "torch>=2.12.1,<2.13",
+    "torchvision>=0.27.1,<0.28",
+    "tqdm>=4.66.5",
+    "wandb>=0.21.0",
+]
+
+[project.optional-dependencies]
+# `make export` / `make bench` backends. Large, so opt-in.
+# onnxruntime-gpu, not onnxruntime: the CPU wheel silently drops the ONNX row in bench
+# to ~20x the GPU latency, which reads as a regression in our code.
+# >=1.29 specifically: that is the first CUDA 13 build, so it links the libcublas.so.13 /
+# libcudart.so.13 that torch's cu130 wheels already ship. ORT 1.21 is a cu12 build and
+# needs nvidia-cudnn-cu12, which installs into the same nvidia/cudnn/lib as torch's
+# cu13 cuDNN and overwrites it - that breaks torch outright.
+export = [
+    "onnx>=1.21.0,<2",
+    "onnxruntime-gpu>=1.29.0,<1.30",
+    "onnxscript>=0.6.2",
+    "onnxsim>=0.4.36; sys_platform == 'linux'",
+    "openvino>=2025.2.0,<2026",
+]
+# ~1 GB of CUDA-specific wheels; the engine must be built on the target GPU anyway.
+# Exact on purpose: the [[tool.uv.dependency-metadata]] override that keeps this on cu12
+# is keyed to this version.
+trt = ["tensorrt==10.13.3.9; sys_platform == 'linux'"]
+# Niche single-script ETL helpers: etl/preprocess.py's PDF and HEIC readers.
+extra = [
+    "pypdfium2>=4.30.0",
+    "pillow-heif>=0.18.0",
+]
+all = [
+    "classifier[export]",
+    "classifier[trt]",
+    "classifier[extra]",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# classifier/config/default.yaml rides along as package data.
+packages = ["classifier"]
+
+[tool.hatch.build.targets.sdist]
+# No root config.yaml: it is the dev machine's live config (absolute paths, private class
+# map). The sanitized twin ships inside the package as classifier/config/default.yaml.
+include = ["classifier", "tests", "README.md"]
+
+[dependency-groups]
+dev = [
+    # Pull every extra into the default dev sync so `uv sync` / `uv run` keep the full
+    # clone workflow (export, trt, …) working without extra flags.
+    "classifier[all]",
+    "pytest>=8",
+    "pytest-xdist>=3",
+    "ruff==0.15.20",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: integration tests that build or load real models (~10-60s)",
+    "gpu: requires CUDA",
+]
+addopts = "-ra --strict-markers"
+
+[tool.uv]
+# The dev group depends on classifier[all], so a plain `uv sync` installs every extra.
+default-groups = ["dev"]
+
+[tool.uv.sources]
+classifier = { workspace = true }
+
+# TensorRT's PyPI shim declares no deps; without these it resolves to nothing usable.
+# Kept on cu12 (torch itself is a cu13 build - the two coexist, as in the tested env).
+[[tool.uv.dependency-metadata]]
+name = "tensorrt"
+version = "10.13.3.9"
+requires-dist = ["tensorrt-cu12==10.13.3.9"]
+
+[[tool.uv.dependency-metadata]]
+name = "tensorrt-cu12"
+version = "10.13.3.9"
+requires-dist = [
+    "tensorrt-cu12-bindings==10.13.3.9",
+    "tensorrt-cu12-libs==10.13.3.9",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "tensorrt-cu12-bindings"
+version = "10.13.3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "tensorrt-cu12-libs"
+version = "10.13.3.9"
+requires-dist = []
