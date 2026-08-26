@@ -11,7 +11,7 @@ def softmax(x: NDArray) -> NDArray:
     return e_x / e_x.sum(axis=-1, keepdims=True)
 
 
-class OV_model:
+class OVModel:
     def __init__(
         self,
         model_path: str,

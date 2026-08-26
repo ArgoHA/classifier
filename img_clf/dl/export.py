@@ -242,7 +242,7 @@ def run_parity(cfg, models_dir: Path, selected: Sequence[str], n_images: int, ha
     Two numbers per backend: the mean cosine of the full probability vector, which catches
     drift before it changes an answer, and top-1 agreement, which is what actually ships.
     """
-    from img_clf.infer.torch_model import Torch_model
+    from img_clf.infer.torch_model import TorchModel
 
     images = _parity_images(cfg, n_images)
     if not images:
@@ -253,7 +253,7 @@ def run_parity(cfg, models_dir: Path, selected: Sequence[str], n_images: int, ha
     # differently from everything it is compared against, and a byte-identical export reads
     # as a parity failure - or, worse, coincidentally passes and hides a real one.
     norms = norm_kwargs(models_dir)
-    reference = Torch_model(model_path=str(models_dir / "model.pt"), half=half, **norms)
+    reference = TorchModel(model_path=str(models_dir / "model.pt"), half=half, **norms)
     ref_probs = [reference.probs(img) for img in images]
 
     rows, failures = [], []

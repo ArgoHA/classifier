@@ -76,31 +76,31 @@ def test_every_backend_matches_torch(run_dir, sample_image):
         pytest.skip("needs CUDA")
 
     from img_clf.dl.ckpt import norm_kwargs
-    from img_clf.infer.torch_model import Torch_model
+    from img_clf.infer.torch_model import TorchModel
 
     # The reference gets the checkpoint's normalization too: comparing two preprocessings
     # would blame the graph for a difference that is in the input.
     norms = norm_kwargs(run_dir)
-    reference = Torch_model(model_path=str(run_dir / "model.pt"), **norms).probs(sample_image)
+    reference = TorchModel(model_path=str(run_dir / "model.pt"), **norms).probs(sample_image)
 
     built = []
     onnx_path = run_dir / "model.onnx"
     if onnx_path.is_file():
-        from img_clf.infer.onnx_model import ONNX_model
+        from img_clf.infer.onnx_model import ONNXModel
 
-        built.append(("ONNX", ONNX_model(model_path=str(onnx_path), **norms)))
+        built.append(("ONNX", ONNXModel(model_path=str(onnx_path), **norms)))
 
     ov_path = run_dir / "model.xml"
     if ov_path.is_file():
-        from img_clf.infer.ov_model import OV_model
+        from img_clf.infer.ov_model import OVModel
 
-        built.append(("OpenVINO", OV_model(model_path=str(ov_path), **norms)))
+        built.append(("OpenVINO", OVModel(model_path=str(ov_path), **norms)))
 
     trt_path = run_dir / "model.engine"
     if trt_path.is_file():
-        from img_clf.infer.trt_model import TensorRT_model
+        from img_clf.infer.trt_model import TRTModel
 
-        built.append(("TensorRT", TensorRT_model(model_path=str(trt_path), **norms)))
+        built.append(("TensorRT", TRTModel(model_path=str(trt_path), **norms)))
 
     if not built:
         pytest.skip("no exported artifacts to compare")
@@ -120,9 +120,9 @@ def test_wrappers_need_only_a_path(run_dir):
 
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-    from img_clf.infer.torch_model import Torch_model
+    from img_clf.infer.torch_model import TorchModel
 
-    model = Torch_model(model_path=str(run_dir / "model.pt"))
+    model = TorchModel(model_path=str(run_dir / "model.pt"))
     assert model.model_name
     assert model.n_outputs > 1
     assert len(model.input_size) == 2

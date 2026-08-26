@@ -9,11 +9,11 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 from img_clf.dl.utils import get_latest_experiment_name
-from img_clf.infer.torch_model import Torch_model
+from img_clf.infer.torch_model import TorchModel
 
 
 def run_prod_infer(
-    model: Torch_model, path_to_data: Path, output_path: Path, label_to_name: Dict[int, str]
+    model: TorchModel, path_to_data: Path, output_path: Path, label_to_name: Dict[int, str]
 ) -> List[int]:
     preds = []
     img_paths = [
@@ -39,7 +39,7 @@ def save_pred(img_path, class_name, output_path):
 @hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
     cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
-    model = Torch_model(model_path=str(Path(cfg.train.path_to_save) / "model.pt"))
+    model = TorchModel(model_path=str(Path(cfg.train.path_to_save) / "model.pt"))
 
     output_path = Path(cfg.train.infer_path)
     if output_path.exists():

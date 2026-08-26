@@ -13,7 +13,7 @@ def softmax(x: NDArray) -> NDArray:
     return e_x / e_x.sum(axis=-1, keepdims=True)
 
 
-class ONNX_model:
+class ONNXModel:
     def __init__(
         self,
         model_path: str,

@@ -6,7 +6,7 @@ import tensorrt as trt
 import torch
 
 
-class TensorRT_model:
+class TRTModel:
     def __init__(
         self,
         model_path: str,

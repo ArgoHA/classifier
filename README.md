@@ -72,16 +72,16 @@ Training writes `{"model": state_dict, "meta": {...}}`, where meta carries `mode
 only a path:
 
 ```python
-from img_clf.infer.trt_model import TensorRT_model
+from img_clf.infer.trt_model import TRTModel
 
-model = TensorRT_model(model_path="output/models/exp/model.engine")
+model = TRTModel(model_path="output/models/exp/model.engine")
 label, prob = model(cv2.imread("img.jpg"))   # BGR in, as cv2 hands it over
 ```
 
 Bare `state_dict` checkpoints from before the envelope still load: missing facts are
 recovered from the `config.yaml` that training freezes next to the weights.
 
-Available wrappers: `Torch_model`, `TensorRT_model`, `OV_model`, `ONNX_model`. All take BGR.
+Available wrappers: `TorchModel`, `TRTModel`, `OVModel`, `ONNXModel`. All take BGR.
 
 `trt_model.py`, `onnx_model.py` and `ov_model.py` import **nothing** from `img_clf` - copy one
 into a service and it works on its own. Each therefore carries its own copy of the

@@ -41,21 +41,21 @@ def _wrapper_class(key: str):
     only its own row instead of the whole benchmark.
     """
     if key == "torch":
-        from img_clf.infer.torch_model import Torch_model
+        from img_clf.infer.torch_model import TorchModel
 
-        return Torch_model
+        return TorchModel
     if key == "tensorrt":
-        from img_clf.infer.trt_model import TensorRT_model
+        from img_clf.infer.trt_model import TRTModel
 
-        return TensorRT_model
+        return TRTModel
     if key == "openvino":
-        from img_clf.infer.ov_model import OV_model
+        from img_clf.infer.ov_model import OVModel
 
-        return OV_model
+        return OVModel
     if key == "onnx":
-        from img_clf.infer.onnx_model import ONNX_model
+        from img_clf.infer.onnx_model import ONNXModel
 
-        return ONNX_model
+        return ONNXModel
     raise ValueError(f"no inference wrapper for backend {key!r}")
 
 

@@ -56,8 +56,8 @@ def _numpy_wrapper(module_name, cls_name):
 @pytest.mark.parametrize(
     "module_name,cls_name",
     [
-        ("img_clf.infer.onnx_model", "ONNX_model"),
-        ("img_clf.infer.ov_model", "OV_model"),
+        ("img_clf.infer.onnx_model", "ONNXModel"),
+        ("img_clf.infer.ov_model", "OVModel"),
     ],
 )
 def test_numpy_wrappers_match_reference(bgr_image, module_name, cls_name):
@@ -67,7 +67,7 @@ def test_numpy_wrappers_match_reference(bgr_image, module_name, cls_name):
 
 def test_torch_wrapper_matches_reference(bgr_image):
     module = pytest.importorskip("img_clf.infer.torch_model")
-    wrapper = _numpy_wrapper("img_clf.infer.torch_model", "Torch_model")
+    wrapper = _numpy_wrapper("img_clf.infer.torch_model", "TorchModel")
     assert module  # keep the import meaningful for linters
     out = wrapper._preprocess(bgr_image).cpu().numpy()
     np.testing.assert_array_equal(out, _reference(bgr_image))
@@ -81,7 +81,7 @@ def test_tensorrt_wrapper_matches_reference(bgr_image):
     module = pytest.importorskip("img_clf.infer.trt_model")
 
     wrapper = _bare(
-        module.TensorRT_model,
+        module.TRTModel,
         input_size=SIZE,
         mean=IMAGENET_MEAN,
         std=IMAGENET_STD,
@@ -94,13 +94,13 @@ def test_tensorrt_wrapper_matches_reference(bgr_image):
 
 def test_non_square_size_is_not_transposed(bgr_image):
     """SIZE is (h, w) while cv2 takes (w, h) - the classic silent swap."""
-    wrapper = _numpy_wrapper("img_clf.infer.onnx_model", "ONNX_model")
+    wrapper = _numpy_wrapper("img_clf.infer.onnx_model", "ONNXModel")
     assert wrapper._preprocess(bgr_image).shape == (1, 3, SIZE[0], SIZE[1])
 
 
 def test_channel_order_is_rgb(bgr_image):
     """Channel 0 out must be the red channel in, i.e. BGR index 2."""
-    wrapper = _numpy_wrapper("img_clf.infer.onnx_model", "ONNX_model")
+    wrapper = _numpy_wrapper("img_clf.infer.onnx_model", "ONNXModel")
     wrapper.input_size = bgr_image.shape[:2]  # no resize, so pixels map 1:1
     out = wrapper._preprocess(bgr_image)[0]
     expected = (bgr_image[:, :, 2].astype(np.float32) / 255.0 - IMAGENET_MEAN[0]) / IMAGENET_STD[0]
@@ -110,10 +110,10 @@ def test_channel_order_is_rgb(bgr_image):
 @pytest.mark.parametrize(
     "module_name,cls_name",
     [
-        ("img_clf.infer.onnx_model", "ONNX_model"),
-        ("img_clf.infer.ov_model", "OV_model"),
-        ("img_clf.infer.trt_model", "TensorRT_model"),
-        ("img_clf.infer.torch_model", "Torch_model"),
+        ("img_clf.infer.onnx_model", "ONNXModel"),
+        ("img_clf.infer.ov_model", "OVModel"),
+        ("img_clf.infer.trt_model", "TRTModel"),
+        ("img_clf.infer.torch_model", "TorchModel"),
     ],
 )
 def test_wrappers_default_to_imagenet_stats(module_name, cls_name):
