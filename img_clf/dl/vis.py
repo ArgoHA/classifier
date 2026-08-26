@@ -7,27 +7,27 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from img_clf.config.resolve import CONFIG_NAME, config_dir
 from omegaconf import DictConfig
 from PIL import Image
 from tqdm import tqdm
 
-from src.dl.train import prepare_model
-from src.dl.utils import get_latest_experiment_name
-from src.ptypes import img_norms, img_size, num_labels
+from img_clf.dl.ckpt import describe_artifact
+from img_clf.dl.train import prepare_model
+from img_clf.dl.utils import get_latest_experiment_name
 
 
-def img_preprocess(image: np.ndarray, device) -> torch.Tensor:
-    mean_norm = np.array(img_norms[0], dtype=np.float32)
-    std_norm = np.array(img_norms[1], dtype=np.float32)
-
-    img = cv2.resize(image, (img_size[1], img_size[0]), cv2.INTER_LINEAR)
-    img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, then HWC to CHW
-    img = np.ascontiguousarray(img, dtype=np.float32)
-    img /= 255.0
-    img = (img - mean_norm[:, None, None]) / std_norm[:, None, None]
-    img = img[None]  # batch dim
-    img = torch.from_numpy(img)
-    return img.to(device)
+def img_preprocess(image: np.ndarray, device, img_size, mean, std) -> torch.Tensor:
+    """Grad-CAM must see exactly the pixels the backends see"""
+    img = cv2.resize(
+        image, (img_size[1], img_size[0]), interpolation=cv2.INTER_AREA
+    )  # cv2 takes (w, h); INTER_AREA to match training
+    img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR->RGB, HWC->CHW
+    img = np.ascontiguousarray(img).astype(np.float32) / 255.0
+    img = (img - np.asarray(mean, np.float32)[:, None, None]) / np.asarray(
+        std, np.float32
+    )[:, None, None]
+    return torch.from_numpy(img[None]).to(device)
 
 
 def compute_gradcam(model, target_layer, img, target_class=None):
@@ -95,7 +95,7 @@ def vis_heatmap(img_pil, heatmap, output_path):
     blended_image.save(output_path)
 
 
-def vis_gradcam(model, folder_to_run, output_path, target_layer, device):
+def vis_gradcam(model, folder_to_run, output_path, target_layer, device, img_size, mean, std):
     print("Processing", folder_to_run.name)
     output_class_path = output_path / folder_to_run.name
     if output_class_path.exists():
@@ -108,7 +108,7 @@ def vis_gradcam(model, folder_to_run, output_path, target_layer, device):
     for img_path in tqdm(img_paths):
         if img_path.is_file():
             img = cv2.imread(str(img_path))
-            img_tensor = img_preprocess(img, device)
+            img_tensor = img_preprocess(img, device, img_size, mean, std)
             img_tensor.requires_grad_()
             img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
@@ -116,20 +116,31 @@ def vis_gradcam(model, folder_to_run, output_path, target_layer, device):
             vis_heatmap(img_pil, heatmap, output_class_path / f"{img_path.stem}.png")
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config")
+@hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
     cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
     folder_to_run = Path(cfg.train.path_to_test_data)
     output_path = Path(cfg.train.visualized_path)
+    ckpt_path = Path(cfg.train.path_to_save) / "model.pt"
+    info = describe_artifact(ckpt_path)
     model = prepare_model(
-        cfg.model_name,
-        Path(cfg.train.path_to_save) / "model.pt",
-        num_labels,
+        info["model_name"] or cfg.model_name,
+        ckpt_path,
+        info["num_classes"] or len(cfg.train.label_to_name),
         cfg.train.device,
     ).to("cpu")
     target_layer = model.conv_head  # last conv layer
 
-    vis_gradcam(model, folder_to_run, output_path, target_layer, "cpu")
+    vis_gradcam(
+        model,
+        folder_to_run,
+        output_path,
+        target_layer,
+        "cpu",
+        info["img_size"] or cfg.train.img_size,
+        info["mean"],
+        info["std"],
+    )
 
 
 if __name__ == "__main__":

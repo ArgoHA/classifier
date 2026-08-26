@@ -19,8 +19,8 @@ the module directly when you want overrides:
 
 ```bash
 make train
-uv run python -m classifier.dl.train model_name=resnet50 train.epochs=100
-uv run python -m classifier.dl.export export.formats=[onnx]
+uv run python -m img_clf.dl.train model_name=resnet50 train.epochs=100
+uv run python -m img_clf.dl.export export.formats=[onnx]
 make train ARGS="train.epochs=50"      # overrides through make
 ```
 
@@ -34,7 +34,7 @@ Dependency notes worth knowing before you bump anything:
 
 ## Configuration
 
-`config.yaml` at the repo root is the live config; `classifier/config/default.yaml` is a
+`config.yaml` at the repo root is the live config; `img_clf/config/default.yaml` is a
 sanitized template to copy from. Key fields:
 
 - **model_name** — any timm model name
@@ -72,7 +72,7 @@ Training writes `{"model": state_dict, "meta": {...}}`, where meta carries `mode
 only a path:
 
 ```python
-from classifier.infer.trt_model import TensorRT_model
+from img_clf.infer.trt_model import TensorRT_model
 
 model = TensorRT_model(model_path="output/models/exp/model.engine")
 label, prob = model(cv2.imread("img.jpg"))   # BGR in, as cv2 hands it over
@@ -81,9 +81,17 @@ label, prob = model(cv2.imread("img.jpg"))   # BGR in, as cv2 hands it over
 Bare `state_dict` checkpoints from before the envelope still load: missing facts are
 recovered from the `config.yaml` that training freezes next to the weights.
 
-Available wrappers: `Torch_model`, `TensorRT_model`, `OV_model`, `ONNX_model`. All take BGR
-and share one preprocessing implementation (`classifier/infer/preprocess.py`), so a change
-to resize or normalization cannot apply to some backends and not others.
+Available wrappers: `Torch_model`, `TensorRT_model`, `OV_model`, `ONNX_model`. All take BGR.
+
+`trt_model.py`, `onnx_model.py` and `ov_model.py` import **nothing** from `img_clf` - copy one
+into a service and it works on its own. Each therefore carries its own copy of the
+preprocessing; `tests/test_preprocess.py` fails if the copies drift, and asserts the three stay
+package-free. `torch_model.py` is the exception, and has to be: a `.pt` is only weights, so
+loading one needs timm and the checkpoint reader.
+
+A graph wrapper reads its input size and class count off its own graph. Normalization it cannot
+know - that belongs to the training run - so it defaults to ImageNet stats, and everything
+driving a run directory passes the trained values in (`backends.norm_kwargs`).
 
 ## Export parity
 

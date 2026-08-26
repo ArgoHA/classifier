@@ -2,7 +2,7 @@
 
 # uv run puts the project venv on sys.path; each module has its own Hydra main().
 # Hydra overrides pass straight through: `make train ARGS="model_name=resnet50"`.
-PY := uv run python -m classifier
+PY := uv run python -m img_clf
 ARGS ?=
 
 main:

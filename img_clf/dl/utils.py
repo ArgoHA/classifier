@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.utils.data
 import torch.nn.functional as F
 import wandb
 from loguru import logger
@@ -53,9 +54,21 @@ def set_seeds(seed: int, cudnn_fixed: bool = False) -> None:
 
 
 def seed_worker(worker_id):  # noqa
+    """Seed every source of randomness a dataloader worker owns.
+
+    torch.initial_seed() is already per-worker and derived from the base seed, so this is
+    reproducible run to run. albumentations needs its own call: its generator is
+    independent of numpy/random, so without this every worker augments from an
+    entropy-seeded stream and the whole run becomes unreproducible.
+    """
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+    info = torch.utils.data.get_worker_info()
+    transform = getattr(getattr(info, "dataset", None), "transform", None)
+    if transform is not None and hasattr(transform, "set_random_seed"):
+        transform.set_random_seed(worker_seed)
 
 
 def wandb_logger(loss, metrics: Dict[str, float], epoch, mode: str) -> None:
@@ -73,8 +86,13 @@ def log_metrics_locally(
     all_metrics: Dict[str, Dict[str, float]],
     path_to_save: Path,
     epoch: int,
-    per_class: Dict[str, Dict[str, float]],
 ) -> None:
+    """Summary table to the log and to metrics.csv.
+
+    Per-class numbers are not written here: `Validator.save_extended_metrics` owns them,
+    together with the threshold sweep, in extended_metrics.csv. Two files with the same
+    long-format per-class rows only invites them to disagree.
+    """
     metrics_df = pd.DataFrame.from_dict(all_metrics, orient="index")
     metrics_df = metrics_df.round(4)
     metrics_df = metrics_df[["accuracy", "f1", "precision", "recall"]]
@@ -88,33 +106,12 @@ def log_metrics_locally(
     if path_to_save:
         metrics_df.to_csv(path_to_save / "metrics.csv")
 
-        rows = []
-        metric_order = ["accuracy", "f1", "precision", "recall"]
-        for split, classes in per_class.items():
-            if classes is None:
-                continue
-            for cls_name, m in classes.items():
-                for met in metric_order:
-                    rows.append(
-                        {
-                            "id": split,
-                            "class": cls_name,
-                            "metric": met,
-                            "value": round(float(m.get(met, float("nan"))), 4),
-                        }
-                    )
-
-        if len(rows) > 0:
-            per_class_df = pd.DataFrame(rows, columns=["id", "class", "metric", "value"])
-            per_class_df.to_csv(path_to_save / "per_class_metrics.csv", index=False)
-
 
 def save_metrics(train_metrics, metrics, loss, epoch, path_to_save, use_wandb) -> None:
     log_metrics_locally(
         all_metrics={"train": train_metrics, "val": metrics},
         path_to_save=path_to_save,
         epoch=epoch,
-        per_class={},
     )
     if use_wandb:
         wandb_logger(loss, train_metrics, epoch, mode="train")
@@ -169,7 +166,6 @@ def get_vram_usage():
         return 0
 
 
-
 def vis_one_image(image: np.ndarray, label: int, mode, label_to_name, score=None) -> None:
     if mode == "gt":
         prefix = "GT: "
@@ -184,7 +180,7 @@ def vis_one_image(image: np.ndarray, label: int, mode, label_to_name, score=None
 
     cv2.putText(
         image,
-        f"{prefix}{label_to_name[int(label)]}{postfix}",
+        f"{prefix}{label_to_name.get(int(label), str(label))}{postfix}",
         position,
         cv2.FONT_HERSHEY_SIMPLEX,
         1,

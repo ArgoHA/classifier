@@ -4,6 +4,7 @@ from pathlib import Path
 import hydra
 import loguru
 import pypdfium2 as pdfium
+from img_clf.config.resolve import CONFIG_NAME, config_dir
 from omegaconf import DictConfig
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
@@ -106,7 +107,7 @@ def convert_images_to_jpg(dir_path: Path, num_threads: int, pdfs_only: bool) -> 
         )
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config")
+@hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
     paths = {"root_path": Path(cfg.train.data_path), "test_path": Path(cfg.train.path_to_test_data)}
     pdfs_only = True

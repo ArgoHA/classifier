@@ -188,105 +188,6 @@ wheels = [
 ]
 
 [[package]]
-name = "classifier"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "albumentations" },
-    { name = "hydra-core" },
-    { name = "loguru" },
-    { name = "matplotlib" },
-    { name = "numpy" },
-    { name = "omegaconf" },
-    { name = "opencv-python-headless" },
-    { name = "pandas" },
-    { name = "pillow" },
-    { name = "pyyaml" },
-    { name = "scikit-learn" },
-    { name = "tabulate" },
-    { name = "timm" },
-    { name = "torch" },
-    { name = "torchvision" },
-    { name = "tqdm" },
-    { name = "wandb" },
-]
-
-[package.optional-dependencies]
-all = [
-    { name = "onnx" },
-    { name = "onnxruntime-gpu" },
-    { name = "onnxscript" },
-    { name = "onnxsim", marker = "sys_platform == 'linux'" },
-    { name = "openvino" },
-    { name = "pillow-heif" },
-    { name = "pypdfium2" },
-    { name = "tensorrt", marker = "sys_platform == 'linux'" },
-]
-export = [
-    { name = "onnx" },
-    { name = "onnxruntime-gpu" },
-    { name = "onnxscript" },
-    { name = "onnxsim", marker = "sys_platform == 'linux'" },
-    { name = "openvino" },
-]
-extra = [
-    { name = "pillow-heif" },
-    { name = "pypdfium2" },
-]
-trt = [
-    { name = "tensorrt", marker = "sys_platform == 'linux'" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "classifier", extra = ["all"] },
-    { name = "pytest" },
-    { name = "pytest-xdist" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "albumentations", specifier = ">=2.0.8,<3" },
-    { name = "classifier", extras = ["export"], marker = "extra == 'all'", editable = "." },
-    { name = "classifier", extras = ["extra"], marker = "extra == 'all'", editable = "." },
-    { name = "classifier", extras = ["trt"], marker = "extra == 'all'", editable = "." },
-    { name = "hydra-core", specifier = ">=1.3.2,<2" },
-    { name = "loguru", specifier = ">=0.7.2" },
-    { name = "matplotlib", specifier = ">=3.10.3" },
-    { name = "numpy", specifier = ">=2.1.1,<3" },
-    { name = "omegaconf", specifier = ">=2.3.0,<3" },
-    { name = "onnx", marker = "extra == 'export'", specifier = ">=1.21.0,<2" },
-    { name = "onnxruntime-gpu", marker = "extra == 'export'", specifier = ">=1.29.0,<1.30" },
-    { name = "onnxscript", marker = "extra == 'export'", specifier = ">=0.6.2" },
-    { name = "onnxsim", marker = "sys_platform == 'linux' and extra == 'export'", specifier = ">=0.4.36" },
-    { name = "opencv-python-headless", specifier = "==4.10.0.84" },
-    { name = "openvino", marker = "extra == 'export'", specifier = ">=2025.2.0,<2026" },
-    { name = "pandas", specifier = ">=2.2.3" },
-    { name = "pillow", specifier = ">=11.1.0" },
-    { name = "pillow-heif", marker = "extra == 'extra'", specifier = ">=0.18.0" },
-    { name = "pypdfium2", marker = "extra == 'extra'", specifier = ">=4.30.0" },
-    { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "scikit-learn", specifier = ">=1.7.0" },
-    { name = "tabulate", specifier = ">=0.9.0" },
-    { name = "tensorrt", marker = "sys_platform == 'linux' and extra == 'trt'", specifier = "==10.13.3.9" },
-    { name = "timm", specifier = ">=1.0.27,<1.1" },
-    { name = "torch", specifier = ">=2.12.1,<2.13" },
-    { name = "torchvision", specifier = ">=0.27.1,<0.28" },
-    { name = "tqdm", specifier = ">=4.66.5" },
-    { name = "wandb", specifier = ">=0.21.0" },
-]
-provides-extras = ["export", "trt", "extra", "all"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "classifier", extras = ["all"], editable = "." },
-    { name = "pytest", specifier = ">=8" },
-    { name = "pytest-xdist", specifier = ">=3" },
-    { name = "ruff", specifier = "==0.15.20" },
-]
-
-[[package]]
 name = "click"
 version = "8.4.2"
 source = { registry = "https://pypi.org/simple" }
@@ -605,6 +506,105 @@ wheels = [
 ]
 
 [[package]]
+name = "img-clf"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "albumentations" },
+    { name = "hydra-core" },
+    { name = "loguru" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "omegaconf" },
+    { name = "opencv-python-headless" },
+    { name = "pandas" },
+    { name = "pillow" },
+    { name = "pyyaml" },
+    { name = "scikit-learn" },
+    { name = "tabulate" },
+    { name = "timm" },
+    { name = "torch" },
+    { name = "torchvision" },
+    { name = "tqdm" },
+    { name = "wandb" },
+]
+
+[package.optional-dependencies]
+all = [
+    { name = "onnx" },
+    { name = "onnxruntime-gpu" },
+    { name = "onnxscript" },
+    { name = "onnxsim", marker = "sys_platform == 'linux'" },
+    { name = "openvino" },
+    { name = "pillow-heif" },
+    { name = "pypdfium2" },
+    { name = "tensorrt", marker = "sys_platform == 'linux'" },
+]
+export = [
+    { name = "onnx" },
+    { name = "onnxruntime-gpu" },
+    { name = "onnxscript" },
+    { name = "onnxsim", marker = "sys_platform == 'linux'" },
+    { name = "openvino" },
+]
+extra = [
+    { name = "pillow-heif" },
+    { name = "pypdfium2" },
+]
+trt = [
+    { name = "tensorrt", marker = "sys_platform == 'linux'" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "img-clf", extra = ["all"] },
+    { name = "pytest" },
+    { name = "pytest-xdist" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "albumentations", specifier = ">=2.0.8,<3" },
+    { name = "hydra-core", specifier = ">=1.3.2,<2" },
+    { name = "img-clf", extras = ["export"], marker = "extra == 'all'", editable = "." },
+    { name = "img-clf", extras = ["extra"], marker = "extra == 'all'", editable = "." },
+    { name = "img-clf", extras = ["trt"], marker = "extra == 'all'", editable = "." },
+    { name = "loguru", specifier = ">=0.7.2" },
+    { name = "matplotlib", specifier = ">=3.10.3" },
+    { name = "numpy", specifier = ">=2.1.1,<3" },
+    { name = "omegaconf", specifier = ">=2.3.0,<3" },
+    { name = "onnx", marker = "extra == 'export'", specifier = ">=1.21.0,<2" },
+    { name = "onnxruntime-gpu", marker = "extra == 'export'", specifier = ">=1.29.0,<1.30" },
+    { name = "onnxscript", marker = "extra == 'export'", specifier = ">=0.6.2" },
+    { name = "onnxsim", marker = "sys_platform == 'linux' and extra == 'export'", specifier = ">=0.4.36" },
+    { name = "opencv-python-headless", specifier = "==4.10.0.84" },
+    { name = "openvino", marker = "extra == 'export'", specifier = ">=2025.2.0,<2026" },
+    { name = "pandas", specifier = ">=2.2.3" },
+    { name = "pillow", specifier = ">=11.1.0" },
+    { name = "pillow-heif", marker = "extra == 'extra'", specifier = ">=0.18.0" },
+    { name = "pypdfium2", marker = "extra == 'extra'", specifier = ">=4.30.0" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "scikit-learn", specifier = ">=1.7.0" },
+    { name = "tabulate", specifier = ">=0.9.0" },
+    { name = "tensorrt", marker = "sys_platform == 'linux' and extra == 'trt'", specifier = "==10.13.3.9" },
+    { name = "timm", specifier = ">=1.0.27,<1.1" },
+    { name = "torch", specifier = ">=2.12.1,<2.13" },
+    { name = "torchvision", specifier = ">=0.27.1,<0.28" },
+    { name = "tqdm", specifier = ">=4.66.5" },
+    { name = "wandb", specifier = ">=0.21.0" },
+]
+provides-extras = ["export", "trt", "extra", "all"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "img-clf", extras = ["all"], editable = "." },
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-xdist", specifier = ">=3" },
+    { name = "ruff", specifier = "==0.15.20" },
+]
+
+[[package]]
 name = "iniconfig"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -728,7 +728,7 @@ name = "markdown-it-py"
 version = "4.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "mdurl", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "mdurl", marker = "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/06/ff/7841249c247aa650a76b9ee4bbaeae59370dc8bfd2f6c01f3630c35eb134/markdown_it_py-4.2.0.tar.gz", hash = "sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49", size = 82454, upload-time = "2026-05-07T12:08:28.36Z" }
 wheels = [
@@ -1212,8 +1212,8 @@ name = "onnxsim"
 version = "0.7.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "onnx", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "rich", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "onnx", marker = "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "rich", marker = "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/25/ff/4e1729128c9b97914e446011903ce76bc8df81d27456ef7161f7713455a7/onnxsim-0.7.3.tar.gz", hash = "sha256:be0f2563d12ec4320b1f4e5866c14507039ed607a83982b12da531faa7405493", size = 3221256, upload-time = "2026-08-12T12:53:42.474Z" }
 wheels = [
@@ -1683,8 +1683,8 @@ name = "rich"
 version = "15.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "markdown-it-py", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "pygments", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "markdown-it-py", marker = "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pygments", marker = "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
 wheels = [
@@ -2035,7 +2035,7 @@ name = "tensorrt"
 version = "10.13.3.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "tensorrt-cu12", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "tensorrt-cu12", marker = "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/77/88/5d4cac975abb19654a6589ce7cd06fab15f6299382b67ba876b9e2438d1f/tensorrt-10.13.3.9.tar.gz", hash = "sha256:89ec5c15c6327c17a9bf592a0801f793c786f45b4f0e0089a3a875d639887fa1", size = 40518, upload-time = "2025-09-05T18:54:22.142Z" }
 
@@ -2044,8 +2044,8 @@ name = "tensorrt-cu12"
 version = "10.13.3.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "tensorrt-cu12-bindings", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "tensorrt-cu12-libs", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "tensorrt-cu12-bindings", marker = "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "tensorrt-cu12-libs", marker = "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1a/aa/5a630ac02d05f7bbc774bd11b2bc9a3d31aa0bd7d38b4cfeef06733544b3/tensorrt_cu12-10.13.3.9.tar.gz", hash = "sha256:b507abc536ceeaac3b2e6527bd65100bef19000d204e7072db6fe85f9f859a84", size = 18175, upload-time = "2025-09-05T19:03:16.524Z" }
 

@@ -5,6 +5,7 @@ import hydra
 import loguru
 import numpy as np
 import pandas as pd
+from img_clf.config.resolve import CONFIG_NAME, config_dir
 from omegaconf import DictConfig
 from sklearn.model_selection import train_test_split
 
@@ -78,7 +79,7 @@ def split(
         loguru.logger.info(f"{split_name}: {df.shape[0]}")
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config")
+@hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
     data_path = Path(cfg.train.data_path)
 

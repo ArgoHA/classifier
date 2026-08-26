@@ -1,5 +1,4 @@
-import time
-from typing import Tuple
+from typing import Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -8,36 +7,48 @@ from openvino import Core
 
 
 def softmax(x: NDArray) -> NDArray:
-    e_x = np.exp(x - np.max(x))
-    return e_x / e_x.sum()
+    e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return e_x / e_x.sum(axis=-1, keepdims=True)
 
 
 class OV_model:
     def __init__(
         self,
         model_path: str,
-        n_outputs: int,
-        input_size: Tuple[int, int] = (256, 256),  # (h, w)
+        n_outputs: Optional[int] = None,
+        input_size: Optional[Tuple[int, int]] = None,  # (h, w)
         half: bool = False,
         max_batch_size=1,
+        mean: Sequence[float] = (0.485, 0.456, 0.406),
+        std: Sequence[float] = (0.229, 0.224, 0.225),
     ):
-        self.mean_norm = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self.std_norm = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        self.input_size = input_size
-        self.n_outputs = n_outputs
         self.model_path = model_path
         self.half = half
         self.max_batch_size = max_batch_size
+        self.mean = tuple(mean)
+        self.std = tuple(std)
+        self.np_dtype = np.float16 if self.half else np.float32
 
-        self._init_params()
+        graph_size, graph_outputs = self._shapes_from_graph()
+        self.input_size = tuple(input_size) if input_size is not None else graph_size
+        self.n_outputs = n_outputs if n_outputs is not None else graph_outputs
+        assert self.input_size, f"input size unknown for {model_path}; pass input_size="
+        assert self.n_outputs, f"class count unknown for {model_path}; pass n_outputs="
+
         self._load_model()
         self._test_pred()
 
-    def _init_params(self) -> None:
-        if self.half:
-            self.np_dtype = np.float16
-        else:
-            self.np_dtype = np.float32
+    def _shapes_from_graph(self) -> Tuple[Optional[Tuple[int, int]], Optional[int]]:
+        """-> ((h, w), n_outputs), read before compiling so a dynamic axis is still visible."""
+        model = Core().read_model(self.model_path)
+        size = outputs = None
+        in_shape = model.inputs[0].partial_shape
+        if len(in_shape) == 4 and in_shape[2].is_static and in_shape[3].is_static:
+            size = (in_shape[2].get_length(), in_shape[3].get_length())
+        out_shape = model.outputs[0].partial_shape
+        if len(out_shape) and out_shape[-1].is_static:
+            outputs = out_shape[-1].get_length()
+        return size, outputs
 
     def _load_model(self):
         core = Core()
@@ -58,30 +69,34 @@ class OV_model:
         )
 
     def _test_pred(self) -> None:
-        input_blob = np.zeros((1, 3, *self.input_size), dtype=self.np_dtype)
-        self._predict(input_blob)
+        self._predict(np.zeros((1, 3, *self.input_size), dtype=self.np_dtype))
 
     def _predict(self, input_blob: NDArray) -> NDArray:
-        result = self.model(input_blob)
-        return result[self.model.output(0)]
+        return self.model(input_blob)[self.model.output(0)]
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
+        """BGR HWC uint8 -> normalized NCHW array. INTER_AREA matches training."""
         img = cv2.resize(
             image, (self.input_size[1], self.input_size[0]), interpolation=cv2.INTER_AREA
-        )  # (w, h)
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, then HWC to CHW
-        img = np.ascontiguousarray(img, dtype=self.np_dtype)
-        img = (img / 255.0).astype(self.np_dtype)
-        img = (img - self.mean_norm[:, None, None]) / self.std_norm[:, None, None]
-        return img[None]
+        )  # cv2 takes (w, h)
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR->RGB, HWC->CHW
+        img = np.ascontiguousarray(img).astype(np.float32) / 255.0
+        mean = np.asarray(self.mean, dtype=np.float32)[:, None, None]
+        std = np.asarray(self.std, dtype=np.float32)[:, None, None]
+        return ((img - mean) / std).astype(self.np_dtype)[None]
 
-    def _postprocess(self, logits: NDArray) -> Tuple[str, float]:
-        probs = softmax(logits)
-        label = int(np.argmax(probs))
-        return label, np.max(probs)
+    def probs(self, image: np.ndarray) -> np.ndarray:
+        """Full softmax vector.
 
-    def __call__(self, image: np.ndarray) -> Tuple[str, float, dict]:
-        image = self._preprocess(image)
-        logits = self._predict(image)
-        label, max_prob = self._postprocess(logits)
-        return label, max_prob
+        The export parity check compares these rather than the predicted label: a graph can
+        shift every probability and still pick the same class, so the whole distribution
+        shows drift before the argmax does.
+        """
+        logits = self._predict(self._preprocess(image))
+        return softmax(logits).reshape(-1)
+
+    def __call__(self, image: np.ndarray) -> Tuple[int, float]:
+        """BGR image in, (label, probability of that label) out."""
+        probabilities = self.probs(image)
+        label = int(np.argmax(probabilities))
+        return label, float(probabilities[label])

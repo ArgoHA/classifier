@@ -1,5 +1,5 @@
 [project]
-name = "classifier"
+name = "img-clf"
 version = "0.1.0"
 description = "Image classification pipeline: timm training, export to ONNX/TensorRT/OpenVINO, and benchmarking"
 readme = "README.md"
@@ -69,9 +69,9 @@ extra = [
     "pillow-heif>=0.18.0",
 ]
 all = [
-    "classifier[export]",
-    "classifier[trt]",
-    "classifier[extra]",
+    "img-clf[export]",
+    "img-clf[trt]",
+    "img-clf[extra]",
 ]
 
 [build-system]
@@ -79,19 +79,19 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-# classifier/config/default.yaml rides along as package data.
-packages = ["classifier"]
+# img_clf/config/default.yaml rides along as package data.
+packages = ["img_clf"]
 
 [tool.hatch.build.targets.sdist]
 # No root config.yaml: it is the dev machine's live config (absolute paths, private class
-# map). The sanitized twin ships inside the package as classifier/config/default.yaml.
-include = ["classifier", "tests", "README.md"]
+# map). The sanitized twin ships inside the package as img_clf/config/default.yaml.
+include = ["img_clf", "tests", "README.md"]
 
 [dependency-groups]
 dev = [
     # Pull every extra into the default dev sync so `uv sync` / `uv run` keep the full
     # clone workflow (export, trt, …) working without extra flags.
-    "classifier[all]",
+    "img-clf[all]",
     "pytest>=8",
     "pytest-xdist>=3",
     "ruff==0.15.20",
@@ -109,11 +109,11 @@ markers = [
 addopts = "-ra --strict-markers"
 
 [tool.uv]
-# The dev group depends on classifier[all], so a plain `uv sync` installs every extra.
+# The dev group depends on img-clf[all], so a plain `uv sync` installs every extra.
 default-groups = ["dev"]
 
 [tool.uv.sources]
-classifier = { workspace = true }
+img-clf = { workspace = true }
 
 # TensorRT's PyPI shim declares no deps; without these it resolves to nothing usable.
 # Kept on cu12 (torch itself is a cu13 build - the two coexist, as in the tested env).

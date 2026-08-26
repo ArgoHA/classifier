@@ -1,6 +1,6 @@
 import random
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import albumentations as A
 import cv2
@@ -8,11 +8,12 @@ import numpy as np
 import pandas as pd
 import torch
 from albumentations.pytorch import ToTensorV2
+from timm.data import Mixup
 from loguru import logger
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Dataset
 
-from src.dl.utils import seed_worker, vis_one_image
+from img_clf.dl.utils import seed_worker, vis_one_image
 
 
 class CustomDataset(Dataset):
@@ -24,15 +25,17 @@ class CustomDataset(Dataset):
         debug_img_processing: bool,
         mode: bool,
         cfg: DictConfig,
+        norm: Tuple[Sequence[float], Sequence[float]],
     ) -> None:
         self.project_path = Path(cfg.train.root)
         self.root_path = root_path
         self.split = split
         self.target_h, self.target_w = img_size
         self.mode = mode
-        self.norm = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        self.norm = norm
         self.debug_img_processing = debug_img_processing
         self.label_to_name = cfg.train.label_to_name
+        self.seed = int(cfg.train.seed)
         self.cases_to_debug = 20
         self._init_augs(cfg)
 
@@ -74,10 +77,10 @@ class CustomDataset(Dataset):
                 ),
             ]
 
-            self.transform = A.Compose(augs + resize + norm)
+            self.transform = A.Compose(augs + resize + norm, seed=self.seed)
         elif self.mode in ["val", "test", "bench"]:
             self.mosaic_prob = 0
-            self.transform = A.Compose(resize + norm)
+            self.transform = A.Compose(resize + norm, seed=self.seed)
         else:
             raise ValueError(
                 f"Unknown mode: {self.mode}, choose from ['train', 'val', 'test', 'bench']"
@@ -123,6 +126,37 @@ class CustomDataset(Dataset):
         return len(self.split)
 
 
+def build_mixup(cfg: DictConfig) -> Optional[Mixup]:
+    """timm Mixup/CutMix, or None when both alphas are 0.
+
+    Batch-level augmentation, so it is built here with the rest of the augmentation config
+    and applied by the training step (on device, after the batch has moved to the GPU -
+    doing it in `train_collate_fn` would run it on CPU inside a worker).
+
+    It emits *soft* targets, so whoever applies it also owns swapping the loss to
+    SoftTargetCrossEntropy; that part stays in the trainer.
+    """
+    augs = cfg.train.augs
+    mixup_alpha = float(augs.get("mixup_alpha", 0.0) or 0.0)
+    cutmix_alpha = float(augs.get("cutmix_alpha", 0.0) or 0.0)
+    if mixup_alpha <= 0 and cutmix_alpha <= 0:
+        return None
+
+    logger.info(
+        f"Mixup enabled: mixup_alpha={mixup_alpha}, cutmix_alpha={cutmix_alpha}, "
+        f"prob={augs.get('mixup_prob', 1.0)}"
+    )
+    return Mixup(
+        mixup_alpha=mixup_alpha,
+        cutmix_alpha=cutmix_alpha,
+        prob=float(augs.get("mixup_prob", 1.0)),
+        switch_prob=float(augs.get("mixup_switch_prob", 0.5)),
+        mode="batch",
+        label_smoothing=cfg.train.label_smoothing,
+        num_classes=len(cfg.train.label_to_name),
+    )
+
+
 class Loader:
     def __init__(
         self,
@@ -131,8 +165,10 @@ class Loader:
         batch_size: int,
         num_workers: int,
         cfg: DictConfig,
+        norm: Tuple[Sequence[float], Sequence[float]],
         debug_img_processing: bool = False,
     ) -> None:
+        self.norm = norm
         self.root_path = root_path
         self.img_size = img_size
         self.batch_size = batch_size
@@ -143,6 +179,8 @@ class Loader:
         self.class_names = list(cfg.train.label_to_name.values())
         self.label_to_name = cfg.train.label_to_name
         self.multiscale_prob = cfg.train.augs.multiscale_prob
+        # Built here with the rest of the augmentation config; the trainer applies it.
+        self.mixup_fn = build_mixup(cfg)
         self.print_class_distribution()
 
     def _get_splits(self) -> None:
@@ -187,6 +225,7 @@ class Loader:
             self.debug_img_processing,
             mode="train",
             cfg=self.cfg,
+            norm=self.norm,
         )
         val_ds = CustomDataset(
             self.img_size,
@@ -195,6 +234,7 @@ class Loader:
             self.debug_img_processing,
             mode="val",
             cfg=self.cfg,
+            norm=self.norm,
         )
 
         train_loader = self._build_dataloader_impl(train_ds, shuffle=True)
@@ -210,6 +250,7 @@ class Loader:
                 self.debug_img_processing,
                 mode="test",
                 cfg=self.cfg,
+                norm=self.norm,
             )
             test_loader = self._build_dataloader_impl(test_ds)
 

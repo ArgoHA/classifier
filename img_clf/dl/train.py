@@ -3,7 +3,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 from shutil import rmtree
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import hydra
 import numpy as np
@@ -11,17 +11,22 @@ import timm
 import torch
 import wandb
 from loguru import logger
+from img_clf.config.resolve import CONFIG_NAME, config_dir
 from omegaconf import DictConfig, OmegaConf
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
-from torch import autocast, nn
+from torch import nn
+from timm.utils.model import freeze
+from timm.data.mixup import mixup_target
+from timm.loss import SoftTargetCrossEntropy
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.dl.dataset import Loader
-from src.dl.utils import (
-    FocalLoss,
+from img_clf.dl.ckpt import resolve_norm, ckpt_meta, load_and_describe, save_checkpoint
+from img_clf.dl.dataset import Loader
+from img_clf.dl.validator import Validator
+
+from img_clf.dl.utils import (
     build_precision_recall_threshold_curves,
     calculate_remaining_time,
     get_vram_usage,
@@ -36,12 +41,74 @@ from src.dl.utils import (
 def build_model(
     model_name: str, pretrained: bool, num_labels: int, device: str, layers_to_train: int
 ) -> nn.Module:
+    """`layers_to_train`: -1 trains everything, N > 0 trains the last N parameter *groups*.
+
+    Groups come from timm's own `group_matcher`, which knows where a given architecture's
+    stages begin. The previous version sliced `list(model.parameters())[:-N]`, i.e. it
+    counted individual tensors in registration order - so "N" meant a different amount of
+    the network for every architecture, and could freeze half of a block while leaving its
+    norm trainable.
+    """
     model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_labels)
     if layers_to_train == -1:
         return model.to(device)
-    for param in list(model.parameters())[:-layers_to_train]:
-        param.requires_grad = False
+
+    groups = _parameter_groups(model)
+    to_freeze = groups[:-layers_to_train] if layers_to_train < len(groups) else []
+    if not to_freeze:
+        logger.warning(
+            f"layers_to_train={layers_to_train} covers all {len(groups)} groups of "
+            f"{model_name}; nothing frozen"
+        )
+    else:
+        # FrozenBatchNorm
+        freeze(model, to_freeze, include_bn_running_stats=False)
+        model._frozen_groups = to_freeze
+        logger.info(f"Frozen {len(to_freeze)}/{len(groups)} groups: {to_freeze}")
     return model.to(device)
+
+
+def _parameter_groups(model: nn.Module) -> List[str]:
+    """Top-level module names, ordered as the forward pass visits them."""
+    return [name for name, _ in model.named_children()]
+
+
+def build_optimizer(
+    model: nn.Module,
+    base_lr: float,
+    weight_decay: float,
+    betas: Sequence[float],
+    backbone_lr: Optional[float] = None,
+) -> torch.optim.Optimizer:
+    """AdamW with weight decay switched off for norm and bias parameters.
+    Decaying a norm's scale pulls it toward zero, which is a change of function, not
+    regularization; the same goes for biases.
+    """
+    backbone_decay, backbone_no_decay, head_decay, head_no_decay = [], [], [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 1-D tensors are norms' weight/bias and every bias; those are the no-decay set.
+        no_decay = param.ndim <= 1 or name.endswith(".bias")
+        is_head = "classifier" in name or "head" in name or name.startswith("fc.")
+        if is_head:
+            (head_no_decay if no_decay else head_decay).append(param)
+        else:
+            (backbone_no_decay if no_decay else backbone_decay).append(param)
+
+    bb_lr = backbone_lr if backbone_lr else base_lr
+    groups = [
+        {"params": backbone_decay, "lr": bb_lr, "initial_lr": bb_lr, "weight_decay": weight_decay},
+        {"params": backbone_no_decay, "lr": bb_lr, "initial_lr": bb_lr, "weight_decay": 0.0},
+        {"params": head_decay, "lr": base_lr, "initial_lr": base_lr, "weight_decay": weight_decay},
+        {"params": head_no_decay, "lr": base_lr, "initial_lr": base_lr, "weight_decay": 0.0},
+    ]
+    counts = [len(g["params"]) for g in groups]
+    logger.info(
+        f"AdamW groups (backbone/head x decay/no-decay): {counts}, "
+        f"backbone_lr={bb_lr:g}, head_lr={base_lr:g}"
+    )
+    return torch.optim.AdamW(groups, lr=base_lr, betas=tuple(betas), weight_decay=weight_decay)
 
 
 def prepare_model(model_name: str, model_path: Path, num_labels: int, device: str) -> nn.Module:
@@ -52,7 +119,7 @@ def prepare_model(model_name: str, model_path: Path, num_labels: int, device: st
         device=device,
         layers_to_train=-1,
     )
-    checkpoint = torch.load(model_path, map_location=torch.device("cpu"), weights_only=True)
+    checkpoint, _ = load_and_describe(model_path)
     model.load_state_dict(checkpoint)
     model.to(device)
     model.eval()
@@ -84,29 +151,49 @@ class Trainer:
         self.path_to_save = Path(cfg.train.path_to_save)
         self.to_visualize_eval = cfg.train.to_visualize_eval
         self.amp_enabled = cfg.train.amp_enabled
+        # bfloat16 by default
+        self.amp_dtype = (
+            torch.float16 if cfg.train.get("amp_dtype") == "float16" else torch.bfloat16
+        )
+        if self.amp_enabled and self.amp_dtype is torch.bfloat16 and self.device == "cuda":
+            assert torch.cuda.is_bf16_supported(), (
+                "bf16 AMP is not supported on this GPU; set train.amp_dtype=float16"
+            )
+        self.decision_metrics = list(cfg.train.get("decision_metrics", ["f1"]))
         self.clip_max_norm = cfg.train.clip_max_norm
         self.b_accum_steps = max(cfg.train.b_accum_steps, 1)
         self.early_stopping = cfg.train.early_stopping
         self.use_wandb = cfg.train.use_wandb
         self.label_to_name = cfg.train.label_to_name
         self.n_labels = len(self.label_to_name)
+        # Averaging mode comes from this configured count, never from the labels present
+        # in a given split (see validator.py).
+        self.validator = Validator(self.n_labels, self.label_to_name)
 
         self.debug_img_path = Path(self.cfg.train.debug_img_path)
         self.eval_preds_path = Path(self.cfg.train.eval_preds_path)
         self.init_dirs()
 
         if self.use_wandb:
-            wandb.init(
-                project=cfg.project_name,
-                name=cfg.exp,
-                config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
-            )
+            try:
+                wandb.init(
+                    project=cfg.project_name,
+                    name=cfg.exp,
+                    config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
+                    settings=wandb.Settings(init_timeout=30),
+                )
+            except Exception as e:
+                logger.warning(f"wandb.init failed ({type(e).__name__}: {e}); continuing without")
+                self.use_wandb = False
 
         log_file = Path(cfg.train.path_to_save) / "train_log.txt"
         log_file.unlink(missing_ok=True)
         logger.add(log_file, format="{message}", level="INFO", rotation="10 MB")
 
         set_seeds(cfg.train.seed, cfg.train.cudnn_fixed)
+
+        self.norm = resolve_norm(cfg.model_name)
+        logger.info(f"Normalization for {cfg.model_name}: mean={self.norm[0]} std={self.norm[1]}")
 
         base_loader = Loader(
             root_path=Path(cfg.train.data_path),
@@ -115,6 +202,7 @@ class Trainer:
             num_workers=cfg.train.num_workers,
             cfg=cfg,
             debug_img_processing=cfg.train.debug_img_processing,
+            norm=self.norm,
         )
         self.train_loader, self.val_loader, self.test_loader = base_loader.build_dataloaders()
 
@@ -131,33 +219,26 @@ class Trainer:
             logger.info("EMA model will be evaluated and saved")
             self.ema_model = ModelEMA(self.model, cfg.train.ema_momentum)
 
-        self.loss_fn = nn.CrossEntropyLoss(label_smoothing=cfg.train.label_smoothing)
-        # self.loss_fn = FocalLoss(
-        #     gamma=2.0, alpha=None, label_smoothing=cfg.train.label_smoothing, reduction="mean"
-        # )
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=cfg.train.base_lr, weight_decay=cfg.train.weight_decay
+        self.mixup_fn = base_loader.mixup_fn
+        if self.mixup_fn is not None:
+            # timm's Mixup emits soft targets and applies label smoothing itself, so the
+            # hard-label CrossEntropy (and its own smoothing) would double-count it.
+            self.loss_fn = SoftTargetCrossEntropy()
+        else:
+            self.loss_fn = nn.CrossEntropyLoss(label_smoothing=cfg.train.label_smoothing)
+
+        self.optimizer = build_optimizer(
+            self.model,
+            base_lr=cfg.train.base_lr,
+            weight_decay=cfg.train.weight_decay,
+            betas=cfg.train.betas,
+            backbone_lr=cfg.train.get("backbone_lr", None),
         )
 
-        # class_weights = None
-        # if cfg.train.class_weights:
-        #     class_weights = torch.tensor(
-        #         cfg.train.class_weights, dtype=torch.float32, device=self.device
-        #     )
-        # self.loss_fn = nn.CrossEntropyLoss(
-        #     label_smoothing=cfg.train.label_smoothing, weight=class_weights
-        # )
-
-        # self.optimizer = torch.optim.Adam(
-        #     self.model.parameters(),
-        #     lr=cfg.train.base_lr,
-        #     weight_decay=cfg.train.weight_decay,
-        #     # betas=cfg.train.betas,
-        # )
-
+        max_lr_mult = float(cfg.train.get("max_lr_mult", 10))
         self.scheduler = OneCycleLR(
             self.optimizer,
-            max_lr=cfg.train.base_lr * 10,
+            max_lr=[g["initial_lr"] * max_lr_mult for g in self.optimizer.param_groups],
             epochs=cfg.train.epochs,
             steps_per_epoch=len(self.train_loader) // self.b_accum_steps,
             pct_start=cfg.train.cycler_pct_start,
@@ -165,10 +246,8 @@ class Trainer:
         )
 
         if self.amp_enabled:
-            self.scaler = GradScaler()
-
-        if self.use_wandb:
-            wandb.watch(self.model)
+            # Disabled for bf16, which makes scale/unscale/step pass straight through.
+            self.scaler = GradScaler(enabled=self.amp_dtype is torch.float16)
 
     def init_dirs(self):
         for path in [self.debug_img_path, self.eval_preds_path]:
@@ -177,72 +256,31 @@ class Trainer:
             path.mkdir(exist_ok=True, parents=True)
 
         self.path_to_save.mkdir(exist_ok=True, parents=True)
+        # Resolved, not raw: this copy is the standalone record of the run, and
+        # ckpt.sibling_config reads it to describe a checkpoint whose meta is incomplete.
+        # Left unresolved, every path in it is a literal "${train.root}/..." string.
         with open(self.path_to_save / "config.yaml", "w") as f:
-            OmegaConf.save(config=self.cfg, f=f)
-
-    @staticmethod
-    def get_metrics(
-        gt_labels: List[int], preds: List[int], per_class: bool, label_to_name=None
-    ) -> Dict[str, float]:
-        num_labels = len(set(gt_labels))
-        if num_labels == 2:
-            average = "binary"
-        else:
-            average = "macro"
-
-        metrics = {}
-        metrics["accuracy"] = accuracy_score(gt_labels, preds)
-        metrics["f1"] = f1_score(gt_labels, preds, average=average)
-        metrics["precision"] = precision_score(gt_labels, preds, average=average)
-        metrics["recall"] = recall_score(gt_labels, preds, average=average)
-
-        if not per_class or num_labels <= 2:
-            return metrics, None
-
-        per_class_metrics = {}
-        unique_labels = sorted(set(gt_labels))
-        f1s = f1_score(gt_labels, preds, average=None, labels=unique_labels)
-        precisions = precision_score(gt_labels, preds, average=None, labels=unique_labels)
-        recalls = recall_score(gt_labels, preds, average=None, labels=unique_labels)
-        accs = []
-
-        for cl in unique_labels:
-            idx = [i for i, lbl in enumerate(gt_labels) if lbl == cl]
-            acc = sum(1 for i in idx if preds[i] == cl) / len(idx) if idx else 0.0
-            accs.append(acc)
-
-        for i, cl in enumerate(unique_labels):
-            class_name = label_to_name.get(cl, cl) if label_to_name else cl
-            per_class_metrics[class_name] = {
-                "accuracy": accs[i],
-                "f1": f1s[i],
-                "precision": precisions[i],
-                "recall": recalls[i],
-            }
-        return metrics, per_class_metrics
-
-    def postprocess(
-        self, probs: torch.Tensor, gt_labels: torch.Tensor
-    ) -> Tuple[List[int], List[int]]:
-        preds = torch.argmax(probs, dim=1).tolist()
-        gt_labels = gt_labels.tolist()
-        return preds, gt_labels
+            OmegaConf.save(config=OmegaConf.to_container(self.cfg, resolve=True), f=f)
 
     def evaluate(
         self,
         test_loader: DataLoader,
         model: nn.Module,
-        device: str,
         path_to_save: Path,
         mode: str,
         per_class: bool,
-    ) -> Dict[str, float]:
-        probs, gt_labels = self.get_full_preds(model, test_loader, device)
+    ) -> Tuple[Dict[str, float], Optional[Dict[str, Dict[str, float]]], Optional[Dict[str, float]]]:
+        """-> (metrics, per-class metrics, F1-optimal threshold).
+
+        The threshold used to be handed back through `self.best_threshold`, which made two
+        consecutive calls order-dependent and invisible in the signature.
+        """
+        probs, gt_labels = self.get_full_preds(model, test_loader)
 
         if path_to_save is not None:
             for class_idx in range(self.n_labels):
                 output_path = path_to_save / "pr_curves"
-                output_path.mkdir(exist_ok=True)
+                output_path.mkdir(exist_ok=True, parents=True)
 
                 build_precision_recall_threshold_curves(
                     gt_labels,
@@ -251,14 +289,21 @@ class Trainer:
                     class_idx,
                 )
 
-        preds, gt_labels = self.postprocess(probs, gt_labels)
-        metrics, per_class_metrics = self.get_metrics(
-            gt_labels, preds, per_class, self.label_to_name
-        )
-        return metrics, per_class_metrics
+        preds, gt_int = self.validator.postprocess(probs, gt_labels)
+        metrics, per_class_metrics = self.validator.get_metrics(gt_int, preds, per_class)
+
+        best_threshold = None
+        if path_to_save is not None:
+            self.validator.save_confusion_matrix(gt_int, preds, path_to_save, mode)
+            # Only a binary task has a threshold to sweep
+            if self.n_labels == 2:
+                best_threshold = self.validator.threshold_sweep(
+                    probs.cpu().numpy(), gt_int, path_to_save, mode
+                )
+        return metrics, per_class_metrics, best_threshold
 
     def get_full_preds(
-        self, model: nn.Module, val_loader: DataLoader, device: str
+        self, model: nn.Module, val_loader: DataLoader
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         val_probs = []  # List to store predicted probabilities for all classes
         val_labels = []
@@ -266,7 +311,7 @@ class Trainer:
 
         with torch.no_grad():
             for idx, (inputs, labels, img_paths) in enumerate(val_loader):
-                inputs, labels = inputs.to(device), labels.to(device)
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
                 logits = model.forward(inputs)
                 probs = torch.softmax(logits, dim=1)
 
@@ -293,17 +338,99 @@ class Trainer:
             model_to_save = self.ema_model.model
 
         self.path_to_save.mkdir(parents=True, exist_ok=True)
-        torch.save(model_to_save.state_dict(), self.path_to_save / "last.pt")
+        meta = ckpt_meta(self.cfg, *self.norm)
+        save_checkpoint(self.path_to_save / "last.pt", model_to_save.state_dict(), meta)
 
-        decision_metric = metrics["f1"]
+        available = [m for m in self.decision_metrics if m in metrics]
+        if not available:
+            raise KeyError(
+                f"none of train.decision_metrics {self.decision_metrics} is reported; "
+                f"available: {sorted(metrics)}"
+            )
+        decision_metric = float(np.mean([metrics[m] for m in available]))
         if decision_metric > best_metric:
             best_metric = decision_metric
             logger.info("Saving new best model🔥")
-            torch.save(model_to_save.state_dict(), self.path_to_save / "model.pt")
+            save_checkpoint(self.path_to_save / "model.pt", model_to_save.state_dict(), meta)
             self.early_stopping_steps = 0
         else:
             self.early_stopping_steps += 1
         return best_metric
+
+    def _apply_mixup(self, inputs, labels):
+        """Mix the batch, or produce matching soft targets when the batch is odd.
+
+        timm's Mixup mirrors the batch - element i mixes with element n-1-i - so it asserts
+        an even length, and the last batch of an epoch usually is not (59 images here, of
+        10,363). Dropping that batch would discard real images every epoch, so instead it
+        skips the mixing and gets the smoothed one-hot targets mixup itself would emit at
+        lam=1. SoftTargetCrossEntropy then sees the same shape for every batch, mixed or not.
+        """
+        if self.mixup_fn is None:
+            return inputs, labels
+        if inputs.shape[0] % 2 == 0:
+            return self.mixup_fn(inputs, labels)
+        return inputs, mixup_target(
+            labels, self.n_labels, lam=1.0, smoothing=self.cfg.train.label_smoothing
+        )
+
+    def _set_train_mode(self) -> None:
+        """`model.train()`, then put any frozen groups back into eval.
+
+        Freezing only clears requires_grad; a BatchNorm in train mode still updates its
+        running statistics from every batch, so a "frozen" backbone would keep drifting.
+        """
+        self.model.train()
+        for name in getattr(self.model, "_frozen_groups", []):
+            getattr(self.model, name).eval()
+
+    def evaluate_best(self, t_start: float) -> None:
+        """Reload the best checkpoint, score val/test, write the run's report."""
+        cfg = self.cfg
+        logger.info("Evaluating best model...")
+        model = prepare_model(
+            model_name=cfg.model_name,
+            model_path=self.path_to_save / "model.pt",
+            num_labels=self.n_labels,
+            device=self.device,
+        )
+        thresholds = {}
+        val_metrics, val_per_class_metrics, thresholds["val"] = self.evaluate(
+            test_loader=self.val_loader,
+            model=model,
+            path_to_save=self.path_to_save,
+            mode="val",
+            per_class=True,
+        )
+        # self.use_wandb, not the config: it is cleared when wandb.init fails, and the
+        # config still says True.
+        if self.use_wandb:
+            wandb_logger(None, val_metrics, epoch=cfg.train.epochs + 1, mode="val")
+
+        test_metrics = {}
+        test_per_class_metrics = {}
+        if self.test_loader:
+            test_metrics, test_per_class_metrics, thresholds["test"] = self.evaluate(
+                test_loader=self.test_loader,
+                model=model,
+                path_to_save=self.path_to_save,
+                mode="test",
+                per_class=True,
+            )
+            if self.use_wandb:
+                wandb_logger(None, test_metrics, epoch=-1, mode="test")
+
+        log_metrics_locally(
+            all_metrics={"val": val_metrics, "test": test_metrics},
+            path_to_save=self.path_to_save,
+            epoch=0,
+        )
+        self.validator.save_extended_metrics(
+            self.path_to_save,
+            {"val": val_per_class_metrics, "test": test_per_class_metrics},
+            thresholds,
+        )
+        logger.info(f"Full training time: {(time.time() - t_start) / 60 / 60:.2f} hours")
 
     def train(self) -> None:
         best_metric = 0
@@ -339,7 +466,7 @@ class Trainer:
 
         for epoch in range(1, self.epochs + 1):
             epoch_start_time = time.time()
-            self.model.train()
+            self._set_train_mode()
             losses = []
 
             with tqdm(self.train_loader, unit="batch") as tepoch:
@@ -350,13 +477,18 @@ class Trainer:
                     cur_iter += 1
 
                     inputs, labels = inputs.to(self.device), labels.to(self.device)
+                    # Train only: validation always scores against hard labels.
+                    inputs, labels = self._apply_mixup(inputs, labels)
 
                     lr = self.optimizer.param_groups[0]["lr"]
 
                     if self.amp_enabled:
-                        with autocast(device_type=self.device, dtype=torch.float16):
+                        with autocast(device_type=self.device, dtype=self.amp_dtype):
                             output = self.model(inputs)
-                            loss = self.loss_fn(output, labels)
+                        # Cross-entropy in fp32: the log-softmax is the one place in this
+                        # graph where reduced precision actually costs accuracy.
+                        with autocast(device_type=self.device, enabled=False):
+                            loss = self.loss_fn(output.float(), labels)
                         self.scaler.scale(loss).backward()
 
                     else:
@@ -389,10 +521,16 @@ class Trainer:
             if self.use_wandb:
                 wandb.log({"lr": lr, "epoch": epoch})
 
-            metrics, _ = self.evaluate(
+            epoch_time = time.time() - epoch_start_time
+            mean_loss = float(np.mean(losses)) * self.b_accum_steps
+            logger.info(
+                f"Epoch {epoch}/{self.epochs} | loss {mean_loss:.4f} | lr {lr:.2e} | "
+                f"{epoch_time:.1f}s | vram {get_vram_usage()}%"
+            )
+
+            metrics, _, _ = self.evaluate(
                 test_loader=self.val_loader,
                 model=self.model,
-                device=self.device,
                 path_to_save=None,
                 mode="val",
                 per_class=False,
@@ -402,78 +540,45 @@ class Trainer:
             save_metrics(
                 {},
                 metrics,
-                np.mean(losses) * self.b_accum_steps,
+                mean_loss,
                 epoch,
                 path_to_save=None,
                 use_wandb=self.use_wandb,
             )
 
-            one_epoch_time = time.time() - epoch_start_time
+            one_epoch_time = epoch_time
 
             if self.early_stopping and self.early_stopping_steps >= self.early_stopping:
                 logger.info("Early stopping")
                 break
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config")
+@hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
     trainer = Trainer(cfg)
 
+    fatal_error = None
     try:
         t_start = time.time()
         trainer.train()
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
     except Exception as e:
-        logger.error(e)
+        # A mid-training OOM (or any hard failure) must not be swallowed
+        logger.exception(e)
+        fatal_error = e
     finally:
-        logger.info("Evaluating best model...")
-        model = prepare_model(
-            model_name=cfg.model_name,
-            model_path=Path(cfg.train.path_to_save) / "model.pt",
-            num_labels=len(cfg.train.label_to_name),
-            device=cfg.train.device,
-        )
-        if trainer.ema_model:
-            trainer.ema_model.model = model
+        ckpt_path = Path(cfg.train.path_to_save) / "model.pt"
+        if fatal_error is not None:
+            logger.error("Training failed; skipping best-model evaluation")
+        elif not ckpt_path.is_file():
+            # Interrupted before the first epoch finished, so nothing was ever saved.
+            logger.error(f"No checkpoint at {ckpt_path}; skipping best-model evaluation")
         else:
-            trainer.model = model
+            trainer.evaluate_best(t_start)
 
-        val_metrics, val_per_class_metrics = trainer.evaluate(
-            test_loader=trainer.val_loader,
-            model=model,
-            device=cfg.train.device,
-            path_to_save=Path(cfg.train.path_to_save),
-            mode="val",
-            per_class=True,
-        )
-        if cfg.train.use_wandb:
-            wandb_logger(None, val_metrics, epoch=cfg.train.epochs + 1, mode="val")
-
-        test_metrics = {}
-        test_per_class_metrics = {}
-        if trainer.test_loader:
-            test_metrics, test_per_class_metrics = trainer.evaluate(
-                test_loader=trainer.test_loader,
-                model=model,
-                device=cfg.train.device,
-                path_to_save=Path(cfg.train.path_to_save),
-                mode="test",
-                per_class=True,
-            )
-            if cfg.train.use_wandb:
-                wandb_logger(None, test_metrics, epoch=-1, mode="test")
-
-        log_metrics_locally(
-            all_metrics={"val": val_metrics, "test": test_metrics},
-            path_to_save=Path(cfg.train.path_to_save),
-            epoch=0,
-            per_class={
-                "val": val_per_class_metrics,
-                "test": test_per_class_metrics,
-            },
-        )
-        logger.info(f"Full training time: {(time.time() - t_start) / 60 / 60:.2f} hours")
+    if fatal_error is not None:
+        raise fatal_error
 
 
 if __name__ == "__main__":

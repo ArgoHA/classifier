@@ -1,24 +1,27 @@
+import gc
 import time
 from pathlib import Path
 from shutil import rmtree
-from typing import Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import hydra
 import numpy as np
 import pandas as pd
+import torch
 from loguru import logger
 from omegaconf import DictConfig
 from tabulate import tabulate
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from src.dl.train import Trainer
-from src.dl.utils import get_latest_experiment_name
-from src.infer.onnx_model import ONNX_model
-from src.infer.ov_model import OV_model
-from src.infer.torch_model import Torch_model
-from src.infer.trt_model import TensorRT_model
+from img_clf.config.resolve import CONFIG_NAME, config_dir
+from img_clf.dl.utils import get_latest_experiment_name, vis_one_image
+from img_clf.dl.validator import Validator
+from img_clf.dl.backends import BACKENDS, norm_kwargs, resolve_formats
+
+WARMUP_ITERS = 10
+_synchronize = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
 
 
 class CustomDataset(Dataset):
@@ -34,70 +37,97 @@ class CustomDataset(Dataset):
         return len(self.split)
 
 
-def save_errors():
-    pass
+def save_error(
+    image: np.ndarray,
+    image_path: str,
+    gt_label: int,
+    pred_label: int,
+    prob: float,
+    output_path: Path,
+    label_to_name: Dict[int, str],
+) -> None:
+    """Write a misclassified image to `<split>/<gt>_as_<pred>/`.
+
+    Foldering by confusion pair is the point: `beagle_as_english_foxhound` filling up tells
+    you which boundary the model cannot see, which a flat dump of failures does not.
+    """
+    gt_name = label_to_name.get(int(gt_label), str(gt_label))
+    pred_name = label_to_name.get(int(pred_label), str(pred_label))
+    out_dir = output_path / f"{gt_name}_as_{pred_name}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    annotated = image.copy()
+    vis_one_image(annotated, gt_label, mode="gt", label_to_name=label_to_name)
+    vis_one_image(annotated, pred_label, mode="pred", label_to_name=label_to_name, score=prob)
+    cv2.imwrite(str(out_dir / f"{Path(image_path).stem}.jpg"), annotated)
 
 
-def test_model(test_loader: DataLoader, data_path: Path, model, name: str, to_save_errors: bool):
+def test_model(
+    test_loader: DataLoader,
+    data_path: Path,
+    model,
+    name: str,
+    errors_path: Optional[Path],
+    validator: Validator,
+    measure_latency: bool = True,
+) -> Tuple[Dict[str, float], List[int], List[int]]:
+    """Run `model` over a split. `errors_path` None means "do not dump misclassifications".
+
+    `measure_latency` False skips the warmup and the synchronize pair, for callers that only
+    want the predictions (`check_errors`) and should not pay for a benchmark.
+    """
     logger.info(f"Testing {name} model")
-    predictions = []
-    gt_labels = []
-    latency = []
+    label_to_name = validator.label_to_name
+    predictions: List[int] = []
+    gt_labels: List[int] = []
+    latency: List[float] = []
 
-    for batch in tqdm(test_loader, total=len(test_loader)):
-        image_paths, labels = batch
-        batch_predictions = []
+    warmup_done = not measure_latency
+    for image_paths, labels in tqdm(test_loader, total=len(test_loader)):
         for im_id, image_path in enumerate(image_paths):
-            image = cv2.imread(data_path / image_path)
+            image = cv2.imread(str(data_path / image_path))
+            if image is None:
+                logger.warning(f"could not read {image_path}; skipping")
+                continue
 
-            t0 = time.perf_counter()
-            pred_label, max_prob = model(image)
-            latency.append((time.perf_counter() - t0) * 1000)
-            batch_predictions.append(pred_label)
+            if not warmup_done:
+                # Lazy allocations, cuDNN autotuning and the first kernel loads all land on
+                # the first calls. Averaging them in makes a fast backend look slow.
+                for _ in range(WARMUP_ITERS):
+                    model(image)
+                _synchronize()
+                warmup_done = True
 
-            if to_save_errors and pred_label != labels[im_id]:
-                save_errors()
+            if measure_latency:
+                _synchronize()
+                t0 = time.perf_counter()
+                pred_label, max_prob = model(image)
+                _synchronize()
+                latency.append((time.perf_counter() - t0) * 1000)
+            else:
+                pred_label, max_prob = model(image)
 
-        predictions.extend(batch_predictions)
-        gt_labels.extend(labels.tolist())
+            gt_label = int(labels[im_id])
+            predictions.append(pred_label)
+            gt_labels.append(gt_label)
+            if errors_path is not None and pred_label != gt_label:
+                save_error(
+                    image, image_path, gt_label, pred_label, max_prob, errors_path, label_to_name
+                )
 
-    metrics, _ = Trainer.get_metrics(gt_labels, predictions, per_class=False)
-    metrics["latency"] = np.mean(latency[1:])
-    return metrics
+    metrics, _ = validator.get_metrics(gt_labels, predictions, per_class=False)
+    if latency:
+        metrics["latency"] = float(np.mean(latency))
+    return metrics, gt_labels, predictions
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config")
+@hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
 def main(cfg: DictConfig):
     data_path = Path(cfg.train.data_path)
     cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
-
-    torch_model = Torch_model(
-        model_name=cfg.model_name,
-        model_path=str(Path(cfg.train.path_to_save) / "model.pt"),
-        n_outputs=len(cfg.train.label_to_name),
-        input_size=cfg.train.img_size,
-        half=cfg.export.half,
-    )
-
-    trt_model = TensorRT_model(
-        model_path=str(Path(cfg.train.path_to_save) / "model.engine"),
-        n_outputs=len(cfg.train.label_to_name),
-        input_size=cfg.train.img_size,
-        half=cfg.export.half,
-    )
-    ov_model = OV_model(
-        model_path=str(Path(cfg.train.path_to_save) / "model.xml"),
-        n_outputs=len(cfg.train.label_to_name),
-        input_size=cfg.train.img_size,
-        half=cfg.export.half,
-    )
-
-    onnx_model = ONNX_model(
-        model_path=str(Path(cfg.train.path_to_save) / "model.onnx"),
-        n_outputs=len(cfg.train.label_to_name),
-        input_size=cfg.train.img_size,
-        half=cfg.export.half,
-    )
+    models_dir = Path(cfg.train.path_to_save)
+    validator = Validator(len(cfg.train.label_to_name), cfg.train.label_to_name)
+    norms = norm_kwargs(models_dir)
 
     test_dataset = CustomDataset(
         root_path=data_path,
@@ -110,27 +140,50 @@ def main(cfg: DictConfig):
         num_workers=cfg.train.num_workers,
     )
 
-    output_path = Path(cfg.train.bench_img_path)
-    if output_path.exists():
-        rmtree(output_path)
+    errors_root = Path(cfg.train.bench_img_path)
+    if errors_root.exists():
+        rmtree(errors_root)
 
     all_metrics = {}
-    models = {
-        "torch": torch_model,
-        "TensorRT": trt_model,
-        "OV": ov_model,
-        "ONNX": onnx_model,
-    }
-    for model_name, model in models.items():
-        all_metrics[model_name] = test_model(
-            test_loader, data_path, model, model_name, to_save_errors=cfg.train.to_save_errors
+    for key in resolve_formats(cfg.bench.formats, BACKENDS, "bench.formats"):
+        backend = BACKENDS[key]
+        try:
+            model = backend.load(models_dir, half=cfg.export.half, **norms)
+        except Exception as e:
+            logger.warning(f"Skipping {backend.display}: {type(e).__name__}: {e}")
+            continue
+        if model is None:
+            logger.info(f"Skipping {backend.display}: {backend.filename} not found")
+            continue
+
+        all_metrics[backend.display], _, _ = test_model(
+            test_loader,
+            data_path,
+            model,
+            backend.display,
+            errors_path=errors_root / backend.display if cfg.train.to_save_errors else None,
+            validator=validator,
         )
 
+        # Drop the backend before timing the next one: a live TensorRT context or ORT
+        # session keeps GPU memory, and the next backend then benchmarks under pressure.
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not all_metrics:
+        logger.error(f"No exported artifacts found in {models_dir} - run `make export` first.")
+        return
+
     metrics_df = pd.DataFrame.from_dict(all_metrics, orient="index")
+    metrics_df.round(4).to_csv(models_dir / "bench_metrics.csv")
     tabulated_data = tabulate(
         metrics_df.round(4), headers="keys", tablefmt="pretty", showindex=True
     )
     print("\n" + tabulated_data)
+    if cfg.train.to_save_errors:
+        logger.info(f"Misclassified images saved to: {errors_root}")
 
 
 if __name__ == "__main__":
