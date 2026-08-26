@@ -1,9 +1,15 @@
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
 import tensorrt as trt
 import torch
+
+
+def softmax(x: np.ndarray) -> np.ndarray:
+    # axis=-1: a global reduction is only correct at batch 1
+    e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return e_x / e_x.sum(axis=-1, keepdims=True)
 
 
 class TRTModel:
@@ -38,6 +44,8 @@ class TRTModel:
         assert self.input_size, f"input size unknown for {model_path}; pass input_size="
         assert self.n_outputs, f"class count unknown for {model_path}; pass n_outputs="
 
+        self.max_batch_size: int = self._max_batch_from_engine()
+
     def _load_engine(self):
         TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
         with open(self.model_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
@@ -60,6 +68,20 @@ class TRTModel:
             elif shape and shape[-1] > 0:
                 outputs = int(shape[-1])
         return size, outputs
+
+    def _max_batch_from_engine(self) -> int:
+        """Largest batch the engine's optimization profile accepts.
+
+        One query covers both kinds of engine: a dynamic-batch engine reports its profile's
+        (min, opt, max), and a static engine reports its fixed shape three times over, so a
+        batch-1 export comes back as 1.
+        """
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                _, _, max_shape = self.engine.get_tensor_profile_shape(name, 0)
+                return int(max_shape[0])
+        raise RuntimeError(f"{self.model_path}: engine has no input tensor")
 
     @staticmethod
     def _torch_dtype_from_trt(trt_dtype):
@@ -120,24 +142,28 @@ class TRTModel:
         self.context.execute_v2(bindings)
         return outputs
 
-    @staticmethod
-    def _softmax(logits: np.ndarray) -> np.ndarray:
-        # max-subtracted: the raw form overflows on large logits
-        e = np.exp(logits - np.max(logits))
-        return e / e.sum()
+    def probs(self, images: Union[np.ndarray, Sequence[np.ndarray]]) -> np.ndarray:
+        """Softmax rows, (N, C) float32, row i for images[i]; one BGR image counts as N=1.
+        Images may have any sizes, each is resized on its own. A sequence runs as batches of
+        at most `max_batch_size`, so the caller never sees a profile/shape error."""
+        if isinstance(images, np.ndarray) and images.ndim == 3:
+            images = [images]
+        step = self.max_batch_size or len(images)
+        rows = []
+        for start in range(0, len(images), step):
+            chunk = [self._preprocess(img) for img in images[start : start + step]]
+            # one image goes straight in: torch.cat of a single tensor is still a copy kernel
+            logits = self._predict(chunk[0] if len(chunk) == 1 else torch.cat(chunk))[0]
+            rows.append(softmax(logits.float().cpu().numpy().reshape(len(chunk), -1)))
+        return np.concatenate(rows)
 
-    def probs(self, image: np.ndarray) -> np.ndarray:
-        """Full softmax vector.
-
-        The export parity check compares these rather than the predicted label: a graph can
-        shift every probability and still pick the same class, so the whole distribution
-        shows drift before the argmax does.
-        """
-        logits = self._predict(self._preprocess(image))
-        return self._softmax(logits[0].squeeze().float().cpu().numpy()).reshape(-1)
-
-    def __call__(self, image: np.ndarray) -> Tuple[int, float]:
-        """BGR image in, (label, probability of that label) out."""
-        probabilities = self.probs(image)
-        label = int(np.argmax(probabilities))
-        return label, float(probabilities[label])
+    def __call__(
+        self, images: Union[np.ndarray, Sequence[np.ndarray]]
+    ) -> List[Dict[str, Union[int, float]]]:
+        """One {"label": class id, "prob": its probability} per image. A lone image gives a
+        one-element list, so callers never branch on what they passed in."""
+        probabilities = self.probs(images)
+        return [
+            {"label": int(label), "prob": float(probabilities[i, label])}
+            for i, label in enumerate(probabilities.argmax(axis=1))
+        ]

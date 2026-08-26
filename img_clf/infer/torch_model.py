@@ -1,4 +1,4 @@
-from typing import Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -30,6 +30,9 @@ class TorchModel:
         assert self.model_name, f"model_name unknown for {model_path}; pass model_name="
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.half = half
+        # No graph-side limit: an nn.Module takes any batch, so a sequence runs as one
+        # forward however many images it holds. Device memory is the only bound.
+        self.max_batch_size: Optional[int] = None
 
         self._init_params()
         self._load_model()
@@ -84,19 +87,28 @@ class TorchModel:
         return torch.from_numpy(img).to(self.device)
 
     @torch.no_grad()
-    def probs(self, image: np.ndarray) -> np.ndarray:
-        """Full softmax vector.
+    def probs(self, images: Union[np.ndarray, Sequence[np.ndarray]]) -> np.ndarray:
+        """Softmax rows, (N, C) float32, row i for images[i]; one BGR image counts as N=1.
+        Images may have any sizes, each is resized on its own. A sequence runs as batches of
+        at most `max_batch_size`, so the caller never sees a profile/shape error."""
+        if isinstance(images, np.ndarray) and images.ndim == 3:
+            images = [images]
+        step = self.max_batch_size or len(images)
+        rows = []
+        for start in range(0, len(images), step):
+            chunk = [self._preprocess(img) for img in images[start : start + step]]
+            # one image goes straight in: torch.cat of a single tensor is still a copy kernel
+            logits = self.model(chunk[0] if len(chunk) == 1 else torch.cat(chunk))
+            rows.append(torch.softmax(logits.float(), dim=1).cpu().numpy())
+        return np.concatenate(rows)
 
-        The export parity check compares these rather than the predicted label: a graph can
-        shift every probability and still pick the same class, so the whole distribution
-        shows drift before the argmax does.
-        """
-        logits = self.model(self._preprocess(image))
-        return torch.softmax(logits, dim=1).cpu().detach().numpy().reshape(-1)
-
-    @torch.no_grad()
-    def __call__(self, image: np.ndarray) -> Tuple[int, float]:
-        """BGR image in, (label, probability of that label) out."""
-        probabilities = self.probs(image)
-        label = int(np.argmax(probabilities))
-        return label, float(probabilities[label])
+    def __call__(
+        self, images: Union[np.ndarray, Sequence[np.ndarray]]
+    ) -> List[Dict[str, Union[int, float]]]:
+        """One {"label": class id, "prob": its probability} per image. A lone image gives a
+        one-element list, so callers never branch on what they passed in."""
+        probabilities = self.probs(images)
+        return [
+            {"label": int(label), "prob": float(probabilities[i, label])}
+            for i, label in enumerate(probabilities.argmax(axis=1))
+        ]

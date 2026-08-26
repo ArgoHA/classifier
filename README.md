@@ -44,6 +44,8 @@ sanitized template to copy from. Key fields:
 - **train.amp_dtype** — `bfloat16` (default) or `float16`
 - **train.decision_metrics** — mean of these picks the best checkpoint
 - **export.formats** / **bench.formats** — `null` for all, or a list to restrict
+- **export.max_batch_size** / **export.opt_batch_size** — batch axis of the exported graphs;
+  `1` (default) bakes in batch 1, see [Batched inference](#batched-inference)
 - **exp** — experiment name used for output paths across train/export/bench
 
 Normalization is **not** configured: it comes from the model's timm `pretrained_cfg`, so
@@ -75,13 +77,53 @@ only a path:
 from img_clf.infer.trt_model import TRTModel
 
 model = TRTModel(model_path="output/models/exp/model.engine")
-label, prob = model(cv2.imread("img.jpg"))   # BGR in, as cv2 hands it over
+pred = model(cv2.imread("img.jpg"))[0]   # BGR in, as cv2 hands it over; {"label": 3, "prob": 0.97}
 ```
 
 Bare `state_dict` checkpoints from before the envelope still load: missing facts are
 recovered from the `config.yaml` that training freezes next to the weights.
 
 Available wrappers: `TorchModel`, `TRTModel`, `OVModel`, `ONNXModel`. All take BGR.
+
+### Batched inference
+
+Every wrapper also classifies a batch - "N crops out of one frame, one forward pass":
+
+```python
+probs = model.probs(images)      # (N, C) float32 softmax rows, row i for images[i]
+preds = model(images)            # [{"label": class_id, "prob": its probability}, ...]
+model.max_batch_size             # int, or None when the graph has no batch limit
+```
+
+`probs` and `__call__` take one BGR image or a sequence of them (list, tuple, or an
+N x H x W x 3 array); a lone image counts as N = 1. Order is preserved, sequences longer
+than `max_batch_size` are chunked internally, and empty input raises `ValueError`. A graph
+exported at batch 1 still works - a sequence degrades to a per-image loop.
+
+`max_batch_size` comes off the graph at load:
+
+| wrapper | `max_batch_size` |
+|---|---|
+| `TorchModel` | `None` - an `nn.Module` takes any batch |
+| `TRTModel` | the engine profile's max batch (`get_tensor_profile_shape`); a static batch-1 engine reports `1` |
+| `ONNXModel` | `None` when the batch axis is dynamic, else the baked-in size (`1`) |
+| `OVModel` | `None` when the batch axis is free, else `1` - it recompiles at batch 1 when the device cannot run a free axis |
+
+#### Exporting for a batched service
+
+```yaml
+export:
+  max_batch_size: 32     # dynamic batch axis; TensorRT profile max
+  opt_batch_size: 8      # batch TensorRT tunes its kernels for
+  dynamic_input: False   # H/W must stay static for the TensorRT profile
+```
+
+or `make export ARGS="export.max_batch_size=32 export.opt_batch_size=8"`. This writes
+`model.onnx` with a `batch_size` axis, `model.engine` with the profile
+`(1,3,H,W) / (8,3,H,W) / (32,3,H,W)`, and `model.xml` with batch `-1`; the wrappers then
+report `max_batch_size` 32 (TensorRT) / `None` (ONNX, OpenVINO). The default stays at 1;
+`opt_batch_size` only tunes TensorRT's kernels, so keep it at 1 if most requests carry one
+crop.
 
 `trt_model.py`, `onnx_model.py` and `ov_model.py` import **nothing** from `img_clf` - copy one
 into a service and it works on its own. Each therefore carries its own copy of the
@@ -99,17 +141,22 @@ driving a run directory passes the trained values in (`ckpt.norm_kwargs`).
 writes `parity.csv`:
 
 ```
-+----------+-------------+------------+----------------+
-|  format  | mean_cosine | min_cosine | top1_agreement |
-+----------+-------------+------------+----------------+
-|   ONNX   |     1.0     |  0.999999  |      8/8       |
-| OpenVINO |     1.0     |  0.999999  |      8/8       |
-| TensorRT |     1.0     |  0.999998  |      8/8       |
-+----------+-------------+------------+----------------+
++----------+-------------+------------+----------------+------------------+----------------------+-----------------+
+|  format  | mean_cosine | min_cosine | top1_agreement | batch_min_cosine | batch_top1_agreement | batch_vs_single |
++----------+-------------+------------+----------------+------------------+----------------------+-----------------+
+|   ONNX   |     1.0     |    1.0     |      8/8       |     0.999998     |         8/8          |     6.8e-04     |
+| OpenVINO |     1.0     |    1.0     |      8/8       |       1.0        |         8/8          |     0.0e+00     |
+| TensorRT |     1.0     |    1.0     |      8/8       |     0.999999     |         8/8          |     0.0e+00     |
++----------+-------------+------------+----------------+------------------+----------------------+-----------------+
 ```
 
 Cosine of the whole softmax vector, not just the argmax: drift shows up there before it
-changes an answer. Below 0.9999 (fp32) it warns loudly.
+changes an answer. The first three columns compare single-image calls against torch; the
+`batch_*` columns compare one batched `probs` call against torch; `batch_vs_single` is the
+largest gap between the backend's own batched and single-image rows - a batched forward may
+pick different kernels, but it must not change the answer. It warns below 0.9999 cosine
+(fp32; 0.99 fp16), on any top-1 disagreement, or on a batch-vs-single gap above 1e-2
+(5e-2 fp16).
 
 ## Outputs
 

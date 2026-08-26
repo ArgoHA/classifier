@@ -236,11 +236,22 @@ def _parity_images(cfg, n: int) -> List[np.ndarray]:
     return images
 
 
-def run_parity(cfg, models_dir: Path, selected: Sequence[str], n_images: int, half: bool) -> None:
-    """Compare every exported backend's softmax against torch on real images.
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
+    return float(a @ b / denom)
 
-    Two numbers per backend: the mean cosine of the full probability vector, which catches
-    drift before it changes an answer, and top-1 agreement, which is what actually ships.
+
+def run_parity(cfg, models_dir: Path, selected: Sequence[str], n_images: int, half: bool) -> None:
+    """Compare every exported backend against torch on real images, singly and as a batch.
+
+    Per backend: cosine of the full probability vector, which catches drift before it
+    changes an answer, and top-1 agreement, which is what actually ships - once for
+    single-image calls and once for one `probs` call over the whole sample, each against
+    the same torch call. Plus the largest gap between the backend's own batched and
+    single-image rows: a batched forward may pick other kernels, but it must not change an
+    answer, so that gap has to be noise.
     """
     from img_clf.infer.torch_model import TorchModel
 
@@ -248,46 +259,87 @@ def run_parity(cfg, models_dir: Path, selected: Sequence[str], n_images: int, ha
     if not images:
         logger.warning("Parity: no images available to compare on")
         return
+    n = len(images)
 
     # The same normalization the graph wrappers get. Without it the reference preprocesses
     # differently from everything it is compared against, and a byte-identical export reads
     # as a parity failure - or, worse, coincidentally passes and hides a real one.
     norms = norm_kwargs(models_dir)
     reference = TorchModel(model_path=str(models_dir / "model.pt"), half=half, **norms)
-    ref_probs = [reference.probs(img) for img in images]
+    ref_single = np.concatenate([reference.probs(img) for img in images])
+    ref_batch = reference.probs(images)
 
-    rows, failures = [], []
     # fp32 must round-trip almost exactly; fp16 legitimately loses a little.
     threshold = 0.99 if half else 0.9999
+    # A backend's batched and single-image rows may come off different kernels: cuDNN's
+    # default TF32 convolutions (torch, ORT) put them up to ~3.5e-3 apart on efficientnet_b0
+    # probabilities; TensorRT happens to be exact. 1e-2 leaves margin and still catches a
+    # swapped row or a softmax over the wrong axis, which differ by ~1.
+    batch_atol = 5e-2 if half else 1e-2
+    ref_gap = float(np.abs(ref_batch - ref_single).max())
+    if ref_gap > batch_atol:
+        logger.warning(
+            f"torch: batched rows differ from single-image rows by up to {ref_gap:.1e} "
+            f"(> {batch_atol:g}); the reference itself is not batch-stable"
+        )
+
+    rows, failures = [], []
     # Same loader bench uses, so the two reports name the backends identically and one
     # graph is resident at a time. torch is the reference above, never a row here.
     for tag, model in load_backends(models_dir, selected, half):
-        cosines, agree = [], 0
-        for img, ref in zip(images, ref_probs):
-            out = model.probs(img)
-            denom = float(np.linalg.norm(ref) * np.linalg.norm(out)) or 1.0
-            cosines.append(float(np.asarray(ref, np.float64) @ np.asarray(out, np.float64) / denom))
-            agree += int(np.argmax(out) == np.argmax(ref))
-        mean_cos = float(np.mean(cosines))
-        top1 = agree / len(images)
-        rows.append([tag, round(mean_cos, 6), round(min(cosines), 6), f"{agree}/{len(images)}"])
-        if mean_cos < threshold or top1 < 1.0:
-            failures.append(f"{tag} cos={mean_cos:.6f} top1={top1:.2f}")
+        single = np.concatenate([model.probs(img) for img in images])
+        batch = model.probs(images)
+
+        cosines = [_cosine(r, o) for r, o in zip(ref_single, single)]
+        top1 = int((single.argmax(1) == ref_single.argmax(1)).sum())
+        batch_cosines = [_cosine(r, o) for r, o in zip(ref_batch, batch)]
+        batch_top1 = int((batch.argmax(1) == ref_batch.argmax(1)).sum())
+        gap = float(np.abs(batch - single).max())
+
+        mean_cos, min_batch_cos = float(np.mean(cosines)), float(min(batch_cosines))
+        rows.append(
+            [
+                tag,
+                round(mean_cos, 6),
+                round(min(cosines), 6),
+                f"{top1}/{n}",
+                round(min_batch_cos, 6),
+                f"{batch_top1}/{n}",
+                f"{gap:.1e}",
+            ]
+        )
+        if mean_cos < threshold or top1 < n:
+            failures.append(f"{tag} single: cos={mean_cos:.6f} top1={top1}/{n}")
+        if min_batch_cos < threshold or batch_top1 < n:
+            failures.append(f"{tag} batch: min cos={min_batch_cos:.6f} top1={batch_top1}/{n}")
+        if gap > batch_atol:
+            failures.append(f"{tag} batch-vs-single gap {gap:.1e} > {batch_atol:g}")
 
     if not rows:
         logger.info("Parity: no exported backends available to compare against torch")
         return
 
-    headers = ["format", "mean_cosine", "min_cosine", "top1_agreement"]
+    headers = [
+        "format",
+        "mean_cosine",
+        "min_cosine",
+        "top1_agreement",
+        "batch_min_cosine",
+        "batch_top1_agreement",
+        "batch_vs_single",
+    ]
     pd.DataFrame(rows, columns=headers).to_csv(models_dir / "parity.csv", index=False)
     print("\n" + tabulate(rows, headers=headers, tablefmt="pretty"))
     if failures:
         logger.warning(
-            f"Parity below threshold (cosine < {threshold} or top-1 disagreement) vs torch: "
-            + ", ".join(failures)
+            f"Parity below threshold (cosine < {threshold}, a top-1 disagreement, or a "
+            f"batch-vs-single gap > {batch_atol:g}) vs torch: " + "; ".join(failures)
         )
     else:
-        logger.info(f"Parity OK: every backend matches torch (cosine >= {threshold}, top-1 1.00)")
+        logger.info(
+            f"Parity OK: every backend matches torch singly and batched (cosine >= "
+            f"{threshold}, top-1 {n}/{n}, batch-vs-single gap <= {batch_atol:g})"
+        )
 
 
 @hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
