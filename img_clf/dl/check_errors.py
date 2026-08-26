@@ -22,7 +22,8 @@ from img_clf.config.resolve import CONFIG_NAME, config_dir
 from img_clf.dl.bench import CustomDataset, test_model
 from img_clf.dl.utils import get_latest_experiment_name
 from img_clf.dl.validator import Validator
-from img_clf.dl.backends import BACKENDS
+from img_clf.dl.ckpt import norm_kwargs
+from img_clf.infer.torch_model import Torch_model
 
 
 @hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
@@ -36,9 +37,12 @@ def main(cfg: DictConfig) -> None:
     if not csv_path.is_file():
         raise FileNotFoundError(f"{csv_path} not found - run `make split` first.")
 
-    model = BACKENDS["torch"].load(models_dir, half=cfg.export.half)
-    if model is None:
-        raise FileNotFoundError(f"{models_dir / 'model.pt'} not found - train first.")
+    model_path = models_dir / "model.pt"
+    if not model_path.is_file():
+        raise FileNotFoundError(f"{model_path} not found - train first.")
+    # norm_kwargs, same as bench: scoring the same split on different preprocessing would
+    # make the confusion-pair dump disagree with bench_metrics.csv for the same weights.
+    model = Torch_model(model_path=str(model_path), half=cfg.export.half, **norm_kwargs(models_dir))
 
     output_path = Path(cfg.train.root) / "output" / "check_errors" / split_name
     if output_path.exists():

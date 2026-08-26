@@ -41,20 +41,27 @@ from img_clf.dl.utils import (
 def build_model(
     model_name: str, pretrained: bool, num_labels: int, device: str, layers_to_train: int
 ) -> nn.Module:
-    """`layers_to_train`: -1 trains everything, N > 0 trains the last N parameter *groups*.
+    """`layers_to_train`: -1 trains everything, N >= 0 trains the last N parameter *groups*
+    and freezes the rest, so 0 freezes the whole network.
 
-    Groups come from timm's own `group_matcher`, which knows where a given architecture's
-    stages begin. The previous version sliced `list(model.parameters())[:-N]`, i.e. it
-    counted individual tensors in registration order - so "N" meant a different amount of
-    the network for every architecture, and could freeze half of a block while leaving its
-    norm trainable.
+    Groups are the model's top-level children in forward order (`_parameter_groups`), so
+    "N" means a comparable amount of network across architectures. The previous version
+    sliced `list(model.parameters())[:-N]`, i.e. it counted individual tensors in
+    registration order - "N" meant a different amount of the network for every
+    architecture, and could freeze half of a block while leaving its norm trainable.
     """
     model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_labels)
     if layers_to_train == -1:
         return model.to(device)
+    if layers_to_train < 0:
+        raise ValueError(
+            f"layers_to_train must be -1 (train everything) or >= 0, got {layers_to_train}"
+        )
 
     groups = _parameter_groups(model)
-    to_freeze = groups[:-layers_to_train] if layers_to_train < len(groups) else []
+    # `len(groups) - N`, not `-N`: `groups[:-0]` is the *empty* slice, so N=0 would freeze
+    # nothing when it means freeze everything, and N=-2 would freeze the first two groups.
+    to_freeze = groups[: max(len(groups) - layers_to_train, 0)]
     if not to_freeze:
         logger.warning(
             f"layers_to_train={layers_to_train} covers all {len(groups)} groups of "
@@ -73,6 +80,21 @@ def _parameter_groups(model: nn.Module) -> List[str]:
     return [name for name, _ in model.named_children()]
 
 
+def _head_param_names(model: nn.Module) -> set:
+    """Names of the classifier's own parameters, asked of timm rather than matched by name.
+
+    `"head" in name` also catches efficientnet's `conv_head` - a 410k-parameter backbone
+    convolution, the largest conv in the network - which then trains at the head learning
+    rate and silently defeats `backbone_lr` for the default model.
+    """
+    get_classifier = getattr(model, "get_classifier", None)
+    head = get_classifier() if callable(get_classifier) else None
+    if head is None:
+        return set()
+    head_params = {id(p) for p in head.parameters()}
+    return {name for name, p in model.named_parameters() if id(p) in head_params}
+
+
 def build_optimizer(
     model: nn.Module,
     base_lr: float,
@@ -85,18 +107,25 @@ def build_optimizer(
     regularization; the same goes for biases.
     """
     backbone_decay, backbone_no_decay, head_decay, head_no_decay = [], [], [], []
+    head_names = _head_param_names(model)
+    if not head_names:
+        logger.warning(
+            f"{type(model).__name__} exposes no classifier parameters; every tensor will "
+            "train at the backbone learning rate"
+        )
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         # 1-D tensors are norms' weight/bias and every bias; those are the no-decay set.
         no_decay = param.ndim <= 1 or name.endswith(".bias")
-        is_head = "classifier" in name or "head" in name or name.startswith("fc.")
-        if is_head:
+        if name in head_names:
             (head_no_decay if no_decay else head_decay).append(param)
         else:
             (backbone_no_decay if no_decay else backbone_decay).append(param)
 
-    bb_lr = backbone_lr if backbone_lr else base_lr
+    # `is None`, not falsy: backbone_lr=0.0 is the standard way to freeze the backbone
+    # while the head still trains, and would otherwise become base_lr.
+    bb_lr = base_lr if backbone_lr is None else backbone_lr
     groups = [
         {"params": backbone_decay, "lr": bb_lr, "initial_lr": bb_lr, "weight_decay": weight_decay},
         {"params": backbone_no_decay, "lr": bb_lr, "initial_lr": bb_lr, "weight_decay": 0.0},

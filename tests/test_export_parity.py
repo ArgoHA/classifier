@@ -10,8 +10,6 @@ import numpy as np
 import pytest
 import yaml
 
-from img_clf.dl.backends import BACKENDS, EXPORT_FORMATS
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -77,25 +75,41 @@ def test_every_backend_matches_torch(run_dir, sample_image):
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
 
+    from img_clf.dl.ckpt import norm_kwargs
     from img_clf.infer.torch_model import Torch_model
 
-    reference = Torch_model(model_path=str(run_dir / "model.pt")).probs(sample_image)
+    # The reference gets the checkpoint's normalization too: comparing two preprocessings
+    # would blame the graph for a difference that is in the input.
+    norms = norm_kwargs(run_dir)
+    reference = Torch_model(model_path=str(run_dir / "model.pt"), **norms).probs(sample_image)
 
-    compared = 0
-    for key in EXPORT_FORMATS:
-        backend = BACKENDS[key]
-        model = backend.load(run_dir)
-        if model is None:
-            continue
-        out = model.probs(sample_image)
+    built = []
+    onnx_path = run_dir / "model.onnx"
+    if onnx_path.is_file():
+        from img_clf.infer.onnx_model import ONNX_model
 
-        cosine = float(np.dot(reference, out) / (np.linalg.norm(reference) * np.linalg.norm(out)))
-        assert cosine > 0.9999, f"{backend.filename} cosine {cosine}"
-        assert int(np.argmax(out)) == int(np.argmax(reference)), f"{backend.filename} top-1 differs"
-        compared += 1
+        built.append(("ONNX", ONNX_model(model_path=str(onnx_path), **norms)))
 
-    if not compared:
+    ov_path = run_dir / "model.xml"
+    if ov_path.is_file():
+        from img_clf.infer.ov_model import OV_model
+
+        built.append(("OpenVINO", OV_model(model_path=str(ov_path), **norms)))
+
+    trt_path = run_dir / "model.engine"
+    if trt_path.is_file():
+        from img_clf.infer.trt_model import TensorRT_model
+
+        built.append(("TensorRT", TensorRT_model(model_path=str(trt_path), **norms)))
+
+    if not built:
         pytest.skip("no exported artifacts to compare")
+
+    for name, model in built:
+        out = model.probs(sample_image)
+        cosine = float(np.dot(reference, out) / (np.linalg.norm(reference) * np.linalg.norm(out)))
+        assert cosine > 0.9999, f"{name} cosine {cosine}"
+        assert int(np.argmax(out)) == int(np.argmax(reference)), f"{name} top-1 differs"
 
 
 @pytest.mark.slow

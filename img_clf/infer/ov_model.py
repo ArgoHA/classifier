@@ -29,18 +29,21 @@ class OV_model:
         self.std = tuple(std)
         self.np_dtype = np.float16 if self.half else np.float32
 
-        graph_size, graph_outputs = self._shapes_from_graph()
+        core = Core()
+        graph = core.read_model(self.model_path)
+
+        graph_size, graph_outputs = self._shapes_from_graph(graph)
         self.input_size = tuple(input_size) if input_size is not None else graph_size
         self.n_outputs = n_outputs if n_outputs is not None else graph_outputs
         assert self.input_size, f"input size unknown for {model_path}; pass input_size="
         assert self.n_outputs, f"class count unknown for {model_path}; pass n_outputs="
 
-        self._load_model()
+        self._load_model(core, graph)
         self._test_pred()
 
-    def _shapes_from_graph(self) -> Tuple[Optional[Tuple[int, int]], Optional[int]]:
-        """-> ((h, w), n_outputs), read before compiling so a dynamic axis is still visible."""
-        model = Core().read_model(self.model_path)
+    @staticmethod
+    def _shapes_from_graph(model) -> Tuple[Optional[Tuple[int, int]], Optional[int]]:
+        """-> ((h, w), n_outputs) off the uncompiled graph."""
         size = outputs = None
         in_shape = model.inputs[0].partial_shape
         if len(in_shape) == 4 and in_shape[2].is_static and in_shape[3].is_static:
@@ -50,10 +53,7 @@ class OV_model:
             outputs = out_shape[-1].get_length()
         return size, outputs
 
-    def _load_model(self):
-        core = Core()
-        det_ov_model = core.read_model(self.model_path)
-
+    def _load_model(self, core: Core, det_ov_model) -> None:
         self.device_name = "CPU"
         if "GPU" in core.get_available_devices():
             self.device_name = "GPU"

@@ -128,9 +128,7 @@ def _no_duplicate_keys(loader, node, deep=False):
     return mapping
 
 
-_DupKeyLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys
-)
+_DupKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys)
 
 
 @pytest.mark.parametrize("path", CONFIGS, ids=lambda p: p.name)

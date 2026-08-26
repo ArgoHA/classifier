@@ -91,7 +91,7 @@ loading one needs timm and the checkpoint reader.
 
 A graph wrapper reads its input size and class count off its own graph. Normalization it cannot
 know - that belongs to the training run - so it defaults to ImageNet stats, and everything
-driving a run directory passes the trained values in (`backends.norm_kwargs`).
+driving a run directory passes the trained values in (`ckpt.norm_kwargs`).
 
 ## Export parity
 

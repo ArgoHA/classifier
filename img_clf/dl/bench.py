@@ -2,7 +2,7 @@ import gc
 import time
 from pathlib import Path
 from shutil import rmtree
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import hydra
@@ -16,12 +16,66 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from img_clf.config.resolve import CONFIG_NAME, config_dir
-from img_clf.dl.utils import get_latest_experiment_name, vis_one_image
+from img_clf.dl.ckpt import norm_kwargs
+from img_clf.dl.utils import get_latest_experiment_name, resolve_formats, vis_one_image
 from img_clf.dl.validator import Validator
-from img_clf.dl.backends import BACKENDS, norm_kwargs, resolve_formats
+
+# key -> (row label, artifact filename), in the order bench reports rows. The labels are
+# the index column of bench_metrics.csv and the `format` column of parity.csv, so both
+# reports go through `load_backends` and stay joinable on backend.
+BACKENDS = {
+    "torch": ("torch", "model.pt"),
+    "tensorrt": ("TensorRT", "model.engine"),
+    "openvino": ("OpenVINO", "model.xml"),
+    "onnx": ("ONNX", "model.onnx"),
+}
 
 WARMUP_ITERS = 10
 _synchronize = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+
+
+def _wrapper_class(key: str):
+    """Format key -> wrapper class, imported on demand.
+
+    On demand rather than at module scope so a missing tensorrt or openvino install costs
+    only its own row instead of the whole benchmark.
+    """
+    if key == "torch":
+        from img_clf.infer.torch_model import Torch_model
+
+        return Torch_model
+    if key == "tensorrt":
+        from img_clf.infer.trt_model import TensorRT_model
+
+        return TensorRT_model
+    if key == "openvino":
+        from img_clf.infer.ov_model import OV_model
+
+        return OV_model
+    if key == "onnx":
+        from img_clf.infer.onnx_model import ONNX_model
+
+        return ONNX_model
+    raise ValueError(f"no inference wrapper for backend {key!r}")
+
+
+def load_backends(
+    models_dir: Path, requested: Optional[Sequence[str]], half: bool
+) -> Iterator[Tuple[str, object]]:
+    """Yield (row label, wrapper) for each exported artifact present, in report order."""
+    norms = norm_kwargs(models_dir)
+    for key in resolve_formats(requested, BACKENDS, "bench.formats"):
+        display, filename = BACKENDS[key]
+        path = models_dir / filename
+        if not path.is_file():
+            logger.info(f"Skipping {display}: {filename} not found")
+            continue
+        try:
+            model = _wrapper_class(key)(model_path=str(path), half=half, **norms)
+        except Exception as e:
+            logger.warning(f"Skipping {display}: {type(e).__name__}: {e}")
+            continue
+        yield display, model
 
 
 class CustomDataset(Dataset):
@@ -127,7 +181,6 @@ def main(cfg: DictConfig):
     cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
     models_dir = Path(cfg.train.path_to_save)
     validator = Validator(len(cfg.train.label_to_name), cfg.train.label_to_name)
-    norms = norm_kwargs(models_dir)
 
     test_dataset = CustomDataset(
         root_path=data_path,
@@ -145,27 +198,17 @@ def main(cfg: DictConfig):
         rmtree(errors_root)
 
     all_metrics = {}
-    for key in resolve_formats(cfg.bench.formats, BACKENDS, "bench.formats"):
-        backend = BACKENDS[key]
-        try:
-            model = backend.load(models_dir, half=cfg.export.half, **norms)
-        except Exception as e:
-            logger.warning(f"Skipping {backend.display}: {type(e).__name__}: {e}")
-            continue
-        if model is None:
-            logger.info(f"Skipping {backend.display}: {backend.filename} not found")
-            continue
-
-        all_metrics[backend.display], _, _ = test_model(
+    for name, model in load_backends(models_dir, cfg.bench.formats, cfg.export.half):
+        all_metrics[name], _, _ = test_model(
             test_loader,
             data_path,
             model,
-            backend.display,
-            errors_path=errors_root / backend.display if cfg.train.to_save_errors else None,
+            name,
+            errors_path=errors_root / name if cfg.train.to_save_errors else None,
             validator=validator,
         )
 
-        # Drop the backend before timing the next one: a live TensorRT context or ORT
+        # Drop the backend before building the next one: a live TensorRT context or ORT
         # session keeps GPU memory, and the next backend then benchmarks under pressure.
         del model
         gc.collect()

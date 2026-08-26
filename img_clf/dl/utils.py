@@ -322,3 +322,14 @@ def get_latest_experiment_name(exp: str, output_dir: str):
     final_exp_name = f"{target_exp_name}_{latest_exp.strftime('%Y-%m-%d')}"
     logger.info(f"Latest experiment: {final_exp_name}")
     return final_exp_name
+
+
+def resolve_formats(requested, known, label: str) -> list:
+    """null / missing -> every key in `known`; a list restricts it and rejects typos."""
+    if not requested:
+        return list(known)
+    requested = [str(f).lower() for f in requested]
+    unknown = set(requested) - set(known)
+    if unknown:
+        raise ValueError(f"unknown {label} {sorted(unknown)}; pick from {list(known)}")
+    return requested

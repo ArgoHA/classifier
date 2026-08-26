@@ -271,3 +271,18 @@ def _describe_artifact_cached(model_path: str, _key: Tuple[int, ...]) -> Dict[st
         "mean": mean,
         "std": std,
     }
+
+
+def norm_kwargs(models_dir: Union[str, Path]) -> Dict[str, Sequence[float]]:
+    """Trained normalization for the inference wrappers, from the checkpoint beside them.
+
+    The wrappers read shape and class count off their own graph, but normalization belongs
+    to the training run rather than to the graph, so on their own they can only default to
+    ImageNet stats. Anything driving them from a run directory must pass the real values -
+    torch included, or the parity check compares two different preprocessings and blames
+    the graph. A model trained with, say, inception stats is otherwise mis-normalized.
+    """
+    info = describe_artifact(Path(models_dir) / "model.pt")
+    if info.get("mean") and info.get("std"):
+        return {"mean": info["mean"], "std": info["std"]}
+    return {}

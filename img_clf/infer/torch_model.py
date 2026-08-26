@@ -40,10 +40,12 @@ class Torch_model:
         needs = [v is None for v in (n_outputs, input_size, mean, std, model_name)]
         info = describe_artifact(model_path) if any(needs) else {}
         self.n_outputs = n_outputs if n_outputs is not None else info.get("num_classes")
-        self.input_size = tuple(input_size if input_size is not None else info.get("img_size"))
+        size = input_size if input_size is not None else info.get("img_size")
+        self.input_size = tuple(size) if size is not None else None
         self.mean = tuple(mean) if mean is not None else info.get("mean") or IMAGENET_MEAN
         self.std = tuple(std) if std is not None else info.get("std") or IMAGENET_STD
         self.label_to_name = info.get("label_to_name")
+        assert self.input_size, f"input size unknown for {model_path}; pass input_size="
         assert self.n_outputs, f"class count unknown for {model_path}; pass n_outputs="
         return info.get("model_name") if model_name is None else model_name
 

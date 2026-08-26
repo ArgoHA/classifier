@@ -11,7 +11,7 @@ for the others.
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import List, Optional, Sequence
 
 import hydra
 import numpy as np
@@ -23,10 +23,14 @@ from tabulate import tabulate
 from torch import nn
 
 from img_clf.config.resolve import CONFIG_NAME, config_dir
-from img_clf.dl.backends import BACKENDS, EXPORT_FORMATS, norm_kwargs, resolve_formats
-from img_clf.dl.ckpt import describe_artifact
+from img_clf.dl.bench import load_backends
+from img_clf.dl.ckpt import describe_artifact, norm_kwargs
 from img_clf.dl.train import prepare_model
-from img_clf.dl.utils import get_latest_experiment_name
+from img_clf.dl.utils import get_latest_experiment_name, resolve_formats
+
+# Order is the order they build in: OpenVINO and TensorRT both consume the ONNX graph.
+# torch is the source of an export, not one of its products, so it is not here.
+EXPORT_FORMATS = ("onnx", "openvino", "tensorrt")
 
 
 def _check_class_count(model_path: Path, n_ckpt: Optional[int], n_config: int) -> None:
@@ -90,16 +94,14 @@ def export_to_onnx(
     if simplify:
         import onnxsim
 
-        onnx_model = onnx.load(output_path)
         try:
-            onnx_model, check = onnxsim.simplify(onnx_model)
-            assert check
-            logger.info("ONNX simplified and exported")
+            simplified, check = onnxsim.simplify(onnx.load(output_path))
+            assert check, "onnxsim reported the simplified graph is not equivalent"
         except Exception as e:
-            # Best effort: a failed simplify must not fail the export, the raw graph is valid.
-            logger.info(f"Simplification failed: {e}")
-        finally:
-            onnx.save(onnx_model, output_path)
+            logger.info(f"Simplification failed, keeping the exported graph: {e}")
+        else:
+            onnx.save(simplified, output_path)
+            logger.info("ONNX simplified and exported")
     return output_path
 
 
@@ -234,23 +236,6 @@ def _parity_images(cfg, n: int) -> List[np.ndarray]:
     return images
 
 
-def _backend_wrappers(models_dir: Path, selected: Sequence[str], half: bool) -> Dict:
-    """Build a wrapper per exported artifact that actually exists. Lazy per backend: a
-    broken openvino install must not hide an ONNX parity failure."""
-    built = {}
-    norms = norm_kwargs(models_dir)
-    for key in selected:
-        backend = BACKENDS[key]
-        try:
-            model = backend.load(models_dir, half=half, **norms)
-        except Exception as e:
-            logger.warning(f"Parity skipped for {backend.display}: {type(e).__name__}: {e}")
-            continue
-        if model is not None:
-            built[backend.display] = model
-    return built
-
-
 def run_parity(cfg, models_dir: Path, selected: Sequence[str], n_images: int, half: bool) -> None:
     """Compare every exported backend's softmax against torch on real images.
 
@@ -264,18 +249,19 @@ def run_parity(cfg, models_dir: Path, selected: Sequence[str], n_images: int, ha
         logger.warning("Parity: no images available to compare on")
         return
 
-    reference = Torch_model(model_path=str(models_dir / "model.pt"), half=half)
+    # The same normalization the graph wrappers get. Without it the reference preprocesses
+    # differently from everything it is compared against, and a byte-identical export reads
+    # as a parity failure - or, worse, coincidentally passes and hides a real one.
+    norms = norm_kwargs(models_dir)
+    reference = Torch_model(model_path=str(models_dir / "model.pt"), half=half, **norms)
     ref_probs = [reference.probs(img) for img in images]
-
-    backends = _backend_wrappers(models_dir, selected, half)
-    if not backends:
-        logger.info("Parity: no exported backends available to compare against torch")
-        return
 
     rows, failures = [], []
     # fp32 must round-trip almost exactly; fp16 legitimately loses a little.
     threshold = 0.99 if half else 0.9999
-    for tag, model in backends.items():
+    # Same loader bench uses, so the two reports name the backends identically and one
+    # graph is resident at a time. torch is the reference above, never a row here.
+    for tag, model in load_backends(models_dir, selected, half):
         cosines, agree = [], 0
         for img, ref in zip(images, ref_probs):
             out = model.probs(img)
@@ -287,6 +273,10 @@ def run_parity(cfg, models_dir: Path, selected: Sequence[str], n_images: int, ha
         rows.append([tag, round(mean_cos, 6), round(min(cosines), 6), f"{agree}/{len(images)}"])
         if mean_cos < threshold or top1 < 1.0:
             failures.append(f"{tag} cos={mean_cos:.6f} top1={top1:.2f}")
+
+    if not rows:
+        logger.info("Parity: no exported backends available to compare against torch")
+        return
 
     headers = ["format", "mean_cosine", "min_cosine", "top1_agreement"]
     pd.DataFrame(rows, columns=headers).to_csv(models_dir / "parity.csv", index=False)
@@ -324,6 +314,8 @@ def main(cfg: DictConfig) -> None:
     model = prepare_model(cfg.model_name, model_path, num_classes, cfg.train.device)
     x_test = torch.randn(max_batch_size, 3, *cfg.train.img_size).to(cfg.train.device)
     _ = model(x_test)  # fail here, on a shape mismatch, rather than inside a converter
+    if half:
+        x_test = x_test.half()
 
     # onnx is needed for both openvino and tensorrt
     onnx_path = export_to_onnx(
@@ -350,7 +342,6 @@ def main(cfg: DictConfig) -> None:
 
     if "tensorrt" in selected:
         export_to_tensorrt(onnx_path, half, max_batch_size, opt_bs=cfg.export.opt_batch_size or 1)
-
 
     logger.info(f"Exports saved to: {models_dir}")
 

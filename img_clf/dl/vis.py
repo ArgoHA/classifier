@@ -24,9 +24,9 @@ def img_preprocess(image: np.ndarray, device, img_size, mean, std) -> torch.Tens
     )  # cv2 takes (w, h); INTER_AREA to match training
     img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR->RGB, HWC->CHW
     img = np.ascontiguousarray(img).astype(np.float32) / 255.0
-    img = (img - np.asarray(mean, np.float32)[:, None, None]) / np.asarray(
-        std, np.float32
-    )[:, None, None]
+    img = (img - np.asarray(mean, np.float32)[:, None, None]) / np.asarray(std, np.float32)[
+        :, None, None
+    ]
     return torch.from_numpy(img[None]).to(device)
 
 
