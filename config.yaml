@@ -1,12 +1,12 @@
-project_name: classifier # for wandb
-exp_name: human_test # experiment name
+project_name: my_project # for wandb
+exp_name: baseline # experiment name
 
 exp: ${exp_name}_${now_dir}
 
 model_name: efficientnet_b0 # models from timm - https://huggingface.co/docs/timm/en/models/
 
 train:
-  root: /home/argo/Desktop/Projects/classifier_bench/ # project root with dataset and outputs
+  root: /path # project root with dataset and outputs
   pretrained: True
 
   data_path: ${train.root}/data/dataset # path to dataset
@@ -24,16 +24,9 @@ train:
   device: cuda
 
   label_to_name: # dataset's classes
-    0: "australian_terrier"
-    1: "beagle"
-    2: "border_terrier"
-    3: "dingo"
-    4: "english_foxhound"
-    5: "golden_retriever"
-    6: "old_english_sheepdog"
-    7: "rhodesian_ridgeback"
-    8: "samoyed"
-    9: "shih_tzu"
+    0: "class_1"
+    1: "class_2"
+    2: "class_3"
 
   img_size: [256, 256] # (h, w)
   to_visualize_eval: True # save images with gt and preds
