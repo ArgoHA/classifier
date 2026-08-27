@@ -21,3 +21,4 @@ output/
 # Local benchmark record - numbers are machine-specific
 BENCHMARK.md
 config_bench.yaml
+notes.md
