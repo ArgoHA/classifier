@@ -22,11 +22,9 @@ def run_prod_infer(
 
     for img_path in tqdm(img_paths):
         img = cv2.imread(str(img_path))  # wrappers take BGR; they do the RGB flip themselves
-        res = model(img)
-
-        f_res = res[0]
-        preds.append(f_res)
-        save_pred(img_path, label_to_name[f_res], output_path)
+        label = model(img)[0]["label"]
+        preds.append(label)
+        save_pred(img_path, label_to_name[label], output_path)
     return preds
 
 

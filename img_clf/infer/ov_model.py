@@ -1,12 +1,14 @@
-from typing import Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+from loguru import logger
 from numpy.typing import NDArray
 from openvino import Core
 
 
 def softmax(x: NDArray) -> NDArray:
+    # axis=-1: a global reduction is only correct at batch 1
     e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
     return e_x / e_x.sum(axis=-1, keepdims=True)
 
@@ -18,13 +20,13 @@ class OVModel:
         n_outputs: Optional[int] = None,
         input_size: Optional[Tuple[int, int]] = None,  # (h, w)
         half: bool = False,
-        max_batch_size=1,
+        max_batch_size: Optional[int] = None,
+        device: Optional[str] = None,
         mean: Sequence[float] = (0.485, 0.456, 0.406),
         std: Sequence[float] = (0.229, 0.224, 0.225),
     ):
         self.model_path = model_path
         self.half = half
-        self.max_batch_size = max_batch_size
         self.mean = tuple(mean)
         self.std = tuple(std)
         self.np_dtype = np.float16 if self.half else np.float32
@@ -32,41 +34,87 @@ class OVModel:
         core = Core()
         graph = core.read_model(self.model_path)
 
-        graph_size, graph_outputs = self._shapes_from_graph(graph)
+        graph_size, graph_outputs, graph_batch = self._shapes_from_graph(graph)
         self.input_size = tuple(input_size) if input_size is not None else graph_size
         self.n_outputs = n_outputs if n_outputs is not None else graph_outputs
         assert self.input_size, f"input size unknown for {model_path}; pass input_size="
         assert self.n_outputs, f"class count unknown for {model_path}; pass n_outputs="
 
-        self._load_model(core, graph)
+        # None = the batch axis is free on the compiled model and nobody capped it, so any N
+        # runs in one call.
+        self.max_batch_size: Optional[int] = self._load_model(
+            core, graph, graph_batch, max_batch_size, device
+        )
         self._test_pred()
 
     @staticmethod
-    def _shapes_from_graph(model) -> Tuple[Optional[Tuple[int, int]], Optional[int]]:
-        """-> ((h, w), n_outputs) off the uncompiled graph."""
+    def _shapes_from_graph(
+        model,
+    ) -> Tuple[Optional[Tuple[int, int]], Optional[int], Optional[int]]:
+        """-> ((h, w), n_outputs, batch) off the uncompiled graph; batch None when free."""
         size = outputs = None
         in_shape = model.inputs[0].partial_shape
         if len(in_shape) == 4 and in_shape[2].is_static and in_shape[3].is_static:
             size = (in_shape[2].get_length(), in_shape[3].get_length())
+        batch = None if in_shape[0].is_dynamic else in_shape[0].get_length()
         out_shape = model.outputs[0].partial_shape
         if len(out_shape) and out_shape[-1].is_static:
             outputs = out_shape[-1].get_length()
-        return size, outputs
+        return size, outputs, batch
 
-    def _load_model(self, core: Core, det_ov_model) -> None:
-        self.device_name = "CPU"
-        if "GPU" in core.get_available_devices():
-            self.device_name = "GPU"
-        if self.device_name != "CPU":
-            det_ov_model.reshape({0: [1, 3, *self.input_size]})
+    def _load_model(
+        self,
+        core: Core,
+        graph,
+        graph_batch: Optional[int],
+        max_batch_size: Optional[int],
+        device: Optional[str],
+    ) -> Optional[int]:
+        """Compile `graph`; returns the batch limit the compiled model ended up with: the
+        tighter of the graph's own limit and the caller's cap, None when neither binds.
 
-        inference_hint = "f16" if self.half else "f32"
-        inference_mode = "CUMULATIVE_THROUGHPUT" if self.max_batch_size > 1 else "LATENCY"
-        self.model = core.compile_model(
-            det_ov_model,
-            self.device_name,
-            config={"PERFORMANCE_HINT": inference_mode, "INFERENCE_PRECISION_HINT": inference_hint},
-        )
+        CPU takes the graph as it is. Any other device gets an explicit shape: a static
+        graph keeps its batch, a free axis capped at 1 is pinned to 1, an uncapped free axis
+        stays free. Not every plugin can actually run a free batch axis - intel_gpu over a
+        non-Intel OpenCL compiles it and then fails on the first infer - so that last case
+        is smoke-tested with a 2-image batch and, if compiling or running it fails,
+        recompiled at a fixed batch of 1 with batching emulated. That keeps a device that
+        serves single images today serving them.
+        """
+        if device:
+            self.device_name = device.upper()
+        else:
+            self.device_name = "GPU" if "GPU" in core.get_available_devices() else "CPU"
+        config = {
+            "PERFORMANCE_HINT": "LATENCY",
+            "INFERENCE_PRECISION_HINT": "f16" if self.half else "f32",
+        }
+        limits = [n for n in (graph_batch, max_batch_size) if n is not None]
+        limit = min(limits) if limits else None
+
+        if self.device_name == "CPU":
+            self.model = core.compile_model(graph, self.device_name, config=config)
+            return limit
+        if graph_batch is not None or limit == 1:
+            # nothing to probe: a static graph keeps its batch, a free axis capped at 1 is pinned
+            graph.reshape({0: [graph_batch or 1, 3, *self.input_size]})
+            self.model = core.compile_model(graph, self.device_name, config=config)
+            return limit
+
+        graph.reshape({0: [-1, 3, *self.input_size]})
+        try:
+            self.model = core.compile_model(graph, self.device_name, config=config)
+            self._predict(np.zeros((2, 3, *self.input_size), dtype=self.np_dtype))
+            return limit
+        except Exception as e:
+            logger.warning(
+                f"OpenVINO {self.device_name} cannot compile or run a free batch axis "
+                f"({type(e).__name__}); recompiling at batch 1 and emulating batching"
+            )
+            logger.debug(str(e))
+            graph.reshape({0: [1, 3, *self.input_size]})
+            self.model = core.compile_model(graph, self.device_name, config=config)
+            return 1
 
     def _test_pred(self) -> None:
         self._predict(np.zeros((1, 3, *self.input_size), dtype=self.np_dtype))
@@ -85,18 +133,29 @@ class OVModel:
         std = np.asarray(self.std, dtype=np.float32)[:, None, None]
         return ((img - mean) / std).astype(self.np_dtype)[None]
 
-    def probs(self, image: np.ndarray) -> np.ndarray:
-        """Full softmax vector.
+    def probs(self, images: Union[np.ndarray, Sequence[np.ndarray]]) -> np.ndarray:
+        """Softmax rows, (N, C) float32, row i for images[i]; one BGR image counts as N=1.
+        Images may have any sizes, each is resized on its own. A sequence runs as batches of
+        at most `max_batch_size`, so the caller never sees a profile/shape error."""
+        if isinstance(images, np.ndarray) and images.ndim == 3:
+            images = [images]
+        step = self.max_batch_size or len(images)
+        rows = []
+        for start in range(0, len(images), step):
+            chunk = [self._preprocess(img) for img in images[start : start + step]]
+            # one image goes straight in: concatenating a single array still copies it
+            logits = self._predict(chunk[0] if len(chunk) == 1 else np.concatenate(chunk))
+            # (N, C) exactly: a graph that lost part of the batch raises instead of smearing rows
+            rows.append(softmax(logits.astype(np.float32).reshape(len(chunk), self.n_outputs)))
+        return np.concatenate(rows)
 
-        The export parity check compares these rather than the predicted label: a graph can
-        shift every probability and still pick the same class, so the whole distribution
-        shows drift before the argmax does.
-        """
-        logits = self._predict(self._preprocess(image))
-        return softmax(logits).reshape(-1)
-
-    def __call__(self, image: np.ndarray) -> Tuple[int, float]:
-        """BGR image in, (label, probability of that label) out."""
-        probabilities = self.probs(image)
-        label = int(np.argmax(probabilities))
-        return label, float(probabilities[label])
+    def __call__(
+        self, images: Union[np.ndarray, Sequence[np.ndarray]]
+    ) -> List[Dict[str, Union[int, float]]]:
+        """One {"label": class id, "prob": its probability} per image. A lone image gives a
+        one-element list, so callers never branch on what they passed in."""
+        probabilities = self.probs(images)
+        return [
+            {"label": int(label), "prob": float(probabilities[i, label])}
+            for i, label in enumerate(probabilities.argmax(axis=1))
+        ]

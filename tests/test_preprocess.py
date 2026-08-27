@@ -140,3 +140,18 @@ def test_graph_wrappers_import_nothing_from_the_package():
     for name in ("trt_model.py", "onnx_model.py", "ov_model.py"):
         offenders = pattern.findall((root / name).read_text())
         assert not offenders, f"{name} imports from img_clf: {offenders}"
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["img_clf.infer.onnx_model", "img_clf.infer.ov_model", "img_clf.infer.trt_model"],
+)
+def test_softmax_copies_normalize_each_row(module_name):
+    """Three package-free copies of one helper, each must normalize per row. TRT's copy
+    once reduced over the whole batch, which is only right at batch 1."""
+    module = pytest.importorskip(module_name)
+    logits = np.random.default_rng(0).normal(size=(4, 7)).astype(np.float32) * 5
+    out = module.softmax(logits)
+    e = np.exp(logits - logits.max(axis=1, keepdims=True))
+    np.testing.assert_allclose(out, e / e.sum(axis=1, keepdims=True), rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(out.sum(axis=1), 1.0, rtol=1e-6)

@@ -155,12 +155,13 @@ def test_model(
             if measure_latency:
                 _synchronize()
                 t0 = time.perf_counter()
-                pred_label, max_prob = model(image)
+                prediction = model(image)[0]
                 _synchronize()
                 latency.append((time.perf_counter() - t0) * 1000)
             else:
-                pred_label, max_prob = model(image)
+                prediction = model(image)[0]
 
+            pred_label, max_prob = prediction["label"], prediction["prob"]
             gt_label = int(labels[im_id])
             predictions.append(pred_label)
             gt_labels.append(gt_label)

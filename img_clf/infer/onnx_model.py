@@ -1,4 +1,4 @@
-from typing import Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -20,6 +20,8 @@ class ONNXModel:
         n_outputs: Optional[int] = None,
         input_size: Optional[Tuple[int, int]] = None,  # (h, w)
         half: bool = False,
+        max_batch_size: Optional[int] = None,
+        device: Optional[str] = None,
         mean: Sequence[float] = (0.485, 0.456, 0.406),
         std: Sequence[float] = (0.229, 0.224, 0.225),
     ):
@@ -28,14 +30,19 @@ class ONNXModel:
         self.mean = tuple(mean)
         self.std = tuple(std)
         self.np_dtype = np.float16 if self.half else np.float32
-        self.device = "cuda" if ort.get_device() == "GPU" else "cpu"
+        self.device = device if device else ("cuda" if ort.get_device() == "GPU" else "cpu")
 
         self._load_model()
-        graph_size, graph_outputs = self._shapes_from_graph()
+        graph_size, graph_outputs, graph_batch = self._shapes_from_graph()
         self.input_size = tuple(input_size) if input_size is not None else graph_size
         self.n_outputs = n_outputs if n_outputs is not None else graph_outputs
         assert self.input_size, f"input size unknown for {model_path}; pass input_size="
         assert self.n_outputs, f"class count unknown for {model_path}; pass n_outputs="
+
+        # The tighter of the graph's limit and the caller's cap; None when neither binds,
+        # i.e. the batch axis is free and any N runs in one session call.
+        limits = [n for n in (graph_batch, max_batch_size) if n is not None]
+        self.max_batch_size: Optional[int] = min(limits) if limits else None
         self._test_pred()
 
     def _load_model(self):
@@ -66,21 +73,24 @@ class ONNXModel:
             self.device = "cpu"
         logger.debug(f"ONNX Runtime providers: {active}")
 
-    def _shapes_from_graph(self) -> Tuple[Optional[Tuple[int, int]], Optional[int]]:
-        """-> ((h, w), n_outputs). A dynamic axis comes back as a string, not an int."""
+    def _shapes_from_graph(self) -> Tuple[Optional[Tuple[int, int]], Optional[int], Optional[int]]:
+        """-> ((h, w), n_outputs, batch). A dynamic axis comes back as a string, not an
+        int; for the batch axis that means no limit, reported as None."""
         shape = self.model.get_inputs()[0].shape
         size = None
         if len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
             size = (int(shape[2]), int(shape[3]))
+        batch = int(shape[0]) if shape and isinstance(shape[0], int) else None
         out_shape = self.model.get_outputs()[0].shape
         outputs = int(out_shape[-1]) if out_shape and isinstance(out_shape[-1], int) else None
-        return size, outputs
+        return size, outputs, batch
 
     def _test_pred(self) -> None:
         self._predict(np.zeros((1, 3, *self.input_size), dtype=self.np_dtype))
 
     def _predict(self, inputs: NDArray) -> NDArray:
-        ort_inputs = {self.model.get_inputs()[0].name: inputs.astype(self.np_dtype)}
+        # copy=False: _preprocess already emits np_dtype, a plain astype would copy the batch
+        ort_inputs = {self.model.get_inputs()[0].name: inputs.astype(self.np_dtype, copy=False)}
         return self.model.run(None, ort_inputs)[0]
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
@@ -94,18 +104,29 @@ class ONNXModel:
         std = np.asarray(self.std, dtype=np.float32)[:, None, None]
         return ((img - mean) / std).astype(self.np_dtype)[None]
 
-    def probs(self, image: np.ndarray) -> np.ndarray:
-        """Full softmax vector.
+    def probs(self, images: Union[np.ndarray, Sequence[np.ndarray]]) -> np.ndarray:
+        """Softmax rows, (N, C) float32, row i for images[i]; one BGR image counts as N=1.
+        Images may have any sizes, each is resized on its own. A sequence runs as batches of
+        at most `max_batch_size`, so the caller never sees a profile/shape error."""
+        if isinstance(images, np.ndarray) and images.ndim == 3:
+            images = [images]
+        step = self.max_batch_size or len(images)
+        rows = []
+        for start in range(0, len(images), step):
+            chunk = [self._preprocess(img) for img in images[start : start + step]]
+            # one image goes straight in: concatenating a single array still copies it
+            logits = self._predict(chunk[0] if len(chunk) == 1 else np.concatenate(chunk))
+            # (N, C) exactly: a graph that lost part of the batch raises instead of smearing rows
+            rows.append(softmax(logits.astype(np.float32).reshape(len(chunk), self.n_outputs)))
+        return np.concatenate(rows)
 
-        The export parity check compares these rather than the predicted label: a graph can
-        shift every probability and still pick the same class, so the whole distribution
-        shows drift before the argmax does.
-        """
-        logits = self._predict(self._preprocess(image))
-        return softmax(logits).reshape(-1)
-
-    def __call__(self, image: np.ndarray) -> Tuple[int, float]:
-        """BGR image in, (label, probability of that label) out."""
-        probabilities = self.probs(image)
-        label = int(np.argmax(probabilities))
-        return label, float(probabilities[label])
+    def __call__(
+        self, images: Union[np.ndarray, Sequence[np.ndarray]]
+    ) -> List[Dict[str, Union[int, float]]]:
+        """One {"label": class id, "prob": its probability} per image. A lone image gives a
+        one-element list, so callers never branch on what they passed in."""
+        probabilities = self.probs(images)
+        return [
+            {"label": int(label), "prob": float(probabilities[i, label])}
+            for i, label in enumerate(probabilities.argmax(axis=1))
+        ]
