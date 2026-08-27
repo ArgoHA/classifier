@@ -19,6 +19,8 @@ class TorchModel:
         n_outputs: Optional[int] = None,
         input_size: Optional[Tuple[int, int]] = None,  # (h, w)
         half: bool = False,
+        max_batch_size: Optional[int] = None,
+        device: Optional[str] = None,
         mean: Sequence[float] = IMAGENET_MEAN,
         std: Sequence[float] = IMAGENET_STD,
     ):
@@ -28,11 +30,12 @@ class TorchModel:
             model_path, n_outputs, input_size, mean, std, model_name
         )
         assert self.model_name, f"model_name unknown for {model_path}; pass model_name="
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         self.half = half
         # No graph-side limit: an nn.Module takes any batch, so a sequence runs as one
-        # forward however many images it holds. Device memory is the only bound.
-        self.max_batch_size: Optional[int] = None
+        # forward however many images it holds unless the caller caps it. Device memory is
+        # otherwise the only bound.
+        self.max_batch_size: Optional[int] = max_batch_size
 
         self._init_params()
         self._load_model()

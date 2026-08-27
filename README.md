@@ -121,7 +121,8 @@ export:
 or `make export ARGS="export.max_batch_size=32 export.opt_batch_size=8"`. This writes
 `model.onnx` with a `batch_size` axis, `model.engine` with the profile
 `(1,3,H,W) / (8,3,H,W) / (32,3,H,W)`, and `model.xml` with batch `-1`; the wrappers then
-report `max_batch_size` 32 (TensorRT) / `None` (ONNX, OpenVINO). The default stays at 1;
+report `max_batch_size` 32 (TensorRT) / `None` (ONNX; OpenVINO too, or `1` where the device
+cannot run a free axis - NVIDIA over OpenCL is one such). The default stays at 1;
 `opt_batch_size` only tunes TensorRT's kernels, so keep it at 1 if most requests carry one
 crop.
 

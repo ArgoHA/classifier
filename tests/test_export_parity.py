@@ -261,6 +261,19 @@ def test_max_batch_size_is_reported(reference, backends):
 
 @pytest.mark.slow
 @pytest.mark.gpu
+def test_max_batch_size_kwarg_caps(reference, backends):
+    """The D-FINE-seg-style constructor cap. It never rises above the graph's own limit, and
+    a cap of 1 keeps any export on the per-image path - what a node still passing the old
+    default gets."""
+    for name, model in [("torch", reference)] + backends:
+        capped = type(model)(
+            model_path=model.model_path, max_batch_size=1, mean=model.mean, std=model.std
+        )
+        assert capped.max_batch_size == 1, name
+
+
+@pytest.mark.slow
+@pytest.mark.gpu
 def test_wrappers_need_only_a_path(run_dir):
     """The envelope's payoff: no model_name / n_outputs / input_size at the call site."""
     _needs_cuda()

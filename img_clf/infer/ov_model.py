@@ -20,6 +20,8 @@ class OVModel:
         n_outputs: Optional[int] = None,
         input_size: Optional[Tuple[int, int]] = None,  # (h, w)
         half: bool = False,
+        max_batch_size: Optional[int] = None,
+        device: Optional[str] = None,
         mean: Sequence[float] = (0.485, 0.456, 0.406),
         std: Sequence[float] = (0.229, 0.224, 0.225),
     ):
@@ -38,8 +40,11 @@ class OVModel:
         assert self.input_size, f"input size unknown for {model_path}; pass input_size="
         assert self.n_outputs, f"class count unknown for {model_path}; pass n_outputs="
 
-        # None = the batch axis is free on the compiled model, so any N runs in one call.
-        self.max_batch_size: Optional[int] = self._load_model(core, graph, graph_batch)
+        # None = the batch axis is free on the compiled model and nobody capped it, so any N
+        # runs in one call.
+        self.max_batch_size: Optional[int] = self._load_model(
+            core, graph, graph_batch, max_batch_size, device
+        )
         self._test_pred()
 
     @staticmethod
@@ -57,36 +62,53 @@ class OVModel:
             outputs = out_shape[-1].get_length()
         return size, outputs, batch
 
-    def _load_model(self, core: Core, graph, graph_batch: Optional[int]) -> Optional[int]:
-        """Compile `graph`; returns the batch limit the compiled model ended up with.
+    def _load_model(
+        self,
+        core: Core,
+        graph,
+        graph_batch: Optional[int],
+        max_batch_size: Optional[int],
+        device: Optional[str],
+    ) -> Optional[int]:
+        """Compile `graph`; returns the batch limit the compiled model ended up with: the
+        tighter of the graph's own limit and the caller's cap, None when neither binds.
 
-        CPU takes the graph as it is. Any other device gets an explicit shape: the batch
-        axis stays free when the graph's is, and is pinned to 1 otherwise. Not every plugin
-        can actually run a free batch axis - intel_gpu over a non-Intel OpenCL compiles it
-        and then fails on the first infer - so a free axis is smoke-tested with a 2-image
-        batch and, if that fails, recompiled at a fixed batch of 1 with batching emulated.
-        That keeps a device that serves single images today serving them.
+        CPU takes the graph as it is. Any other device gets an explicit shape: a static
+        graph keeps its batch, a free axis capped at 1 is pinned to 1, an uncapped free axis
+        stays free. Not every plugin can actually run a free batch axis - intel_gpu over a
+        non-Intel OpenCL compiles it and then fails on the first infer - so that last case
+        is smoke-tested with a 2-image batch and, if compiling or running it fails,
+        recompiled at a fixed batch of 1 with batching emulated. That keeps a device that
+        serves single images today serving them.
         """
-        self.device_name = "GPU" if "GPU" in core.get_available_devices() else "CPU"
+        if device:
+            self.device_name = device.upper()
+        else:
+            self.device_name = "GPU" if "GPU" in core.get_available_devices() else "CPU"
         config = {
             "PERFORMANCE_HINT": "LATENCY",
             "INFERENCE_PRECISION_HINT": "f16" if self.half else "f32",
         }
+        limits = [n for n in (graph_batch, max_batch_size) if n is not None]
+        limit = min(limits) if limits else None
+
         if self.device_name == "CPU":
             self.model = core.compile_model(graph, self.device_name, config=config)
-            return graph_batch
+            return limit
+        if graph_batch is not None or limit == 1:
+            # nothing to probe: a static graph keeps its batch, a free axis capped at 1 is pinned
+            graph.reshape({0: [graph_batch or 1, 3, *self.input_size]})
+            self.model = core.compile_model(graph, self.device_name, config=config)
+            return limit
 
-        batch = -1 if graph_batch is None else graph_batch
-        graph.reshape({0: [batch, 3, *self.input_size]})
-        self.model = core.compile_model(graph, self.device_name, config=config)
-        if batch != -1:
-            return graph_batch
+        graph.reshape({0: [-1, 3, *self.input_size]})
         try:
+            self.model = core.compile_model(graph, self.device_name, config=config)
             self._predict(np.zeros((2, 3, *self.input_size), dtype=self.np_dtype))
-            return None
+            return limit
         except Exception as e:
             logger.warning(
-                f"OpenVINO {self.device_name} compiled a free batch axis but cannot run it "
+                f"OpenVINO {self.device_name} cannot compile or run a free batch axis "
                 f"({type(e).__name__}); recompiling at batch 1 and emulating batching"
             )
             logger.debug(str(e))
@@ -123,7 +145,8 @@ class OVModel:
             chunk = [self._preprocess(img) for img in images[start : start + step]]
             # one image goes straight in: concatenating a single array still copies it
             logits = self._predict(chunk[0] if len(chunk) == 1 else np.concatenate(chunk))
-            rows.append(softmax(logits.astype(np.float32).reshape(len(chunk), -1)))
+            # (N, C) exactly: a graph that lost part of the batch raises instead of smearing rows
+            rows.append(softmax(logits.astype(np.float32).reshape(len(chunk), self.n_outputs)))
         return np.concatenate(rows)
 
     def __call__(

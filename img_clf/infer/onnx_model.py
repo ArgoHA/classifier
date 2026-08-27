@@ -20,6 +20,8 @@ class ONNXModel:
         n_outputs: Optional[int] = None,
         input_size: Optional[Tuple[int, int]] = None,  # (h, w)
         half: bool = False,
+        max_batch_size: Optional[int] = None,
+        device: Optional[str] = None,
         mean: Sequence[float] = (0.485, 0.456, 0.406),
         std: Sequence[float] = (0.229, 0.224, 0.225),
     ):
@@ -28,7 +30,7 @@ class ONNXModel:
         self.mean = tuple(mean)
         self.std = tuple(std)
         self.np_dtype = np.float16 if self.half else np.float32
-        self.device = "cuda" if ort.get_device() == "GPU" else "cpu"
+        self.device = device if device else ("cuda" if ort.get_device() == "GPU" else "cpu")
 
         self._load_model()
         graph_size, graph_outputs, graph_batch = self._shapes_from_graph()
@@ -37,8 +39,10 @@ class ONNXModel:
         assert self.input_size, f"input size unknown for {model_path}; pass input_size="
         assert self.n_outputs, f"class count unknown for {model_path}; pass n_outputs="
 
-        # None = the batch axis is free, so any N runs in one session call.
-        self.max_batch_size: Optional[int] = graph_batch
+        # The tighter of the graph's limit and the caller's cap; None when neither binds,
+        # i.e. the batch axis is free and any N runs in one session call.
+        limits = [n for n in (graph_batch, max_batch_size) if n is not None]
+        self.max_batch_size: Optional[int] = min(limits) if limits else None
         self._test_pred()
 
     def _load_model(self):
@@ -85,7 +89,8 @@ class ONNXModel:
         self._predict(np.zeros((1, 3, *self.input_size), dtype=self.np_dtype))
 
     def _predict(self, inputs: NDArray) -> NDArray:
-        ort_inputs = {self.model.get_inputs()[0].name: inputs.astype(self.np_dtype)}
+        # copy=False: _preprocess already emits np_dtype, a plain astype would copy the batch
+        ort_inputs = {self.model.get_inputs()[0].name: inputs.astype(self.np_dtype, copy=False)}
         return self.model.run(None, ort_inputs)[0]
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
@@ -111,7 +116,8 @@ class ONNXModel:
             chunk = [self._preprocess(img) for img in images[start : start + step]]
             # one image goes straight in: concatenating a single array still copies it
             logits = self._predict(chunk[0] if len(chunk) == 1 else np.concatenate(chunk))
-            rows.append(softmax(logits.astype(np.float32).reshape(len(chunk), -1)))
+            # (N, C) exactly: a graph that lost part of the batch raises instead of smearing rows
+            rows.append(softmax(logits.astype(np.float32).reshape(len(chunk), self.n_outputs)))
         return np.concatenate(rows)
 
     def __call__(
