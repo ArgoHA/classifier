@@ -18,7 +18,6 @@ output/
 *.xml
 *.bin
 
-# Local benchmark record - numbers are machine-specific
-BENCHMARK.md
-config_bench.yaml
+# Local files
 notes.md
+configs/*
