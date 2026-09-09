@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from img_clf.dl.utils import get_latest_experiment_name
 from img_clf.infer.torch_model import TorchModel
+from img_clf.infer.zero_shot_model import ZeroShotModel
 
 
 def run_prod_infer(
@@ -36,8 +37,14 @@ def save_pred(img_path, class_name, output_path):
 
 @hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
-    cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
-    model = TorchModel(model_path=str(Path(cfg.train.path_to_save) / "model.pt"))
+    if cfg.infer.zero_shot:
+        # ids line up with label_to_name for run_prod_infer.
+        model = ZeroShotModel(
+            hub=str(cfg.infer.hub), labels=cfg.train.label_to_name, template=str(cfg.infer.template)
+        )
+    else:
+        cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
+        model = TorchModel(model_path=str(Path(cfg.train.path_to_save) / "model.pt"))
 
     output_path = Path(cfg.train.infer_path)
     if output_path.exists():

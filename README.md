@@ -86,7 +86,26 @@ pred = model(cv2.imread("img.jpg"))[0]   # BGR in, as cv2 hands it over; {"label
 Bare `state_dict` checkpoints from before the envelope still load: missing facts are
 recovered from the `config.yaml` that training freezes next to the weights.
 
-Available wrappers: `TorchModel`, `TRTModel`, `OVModel`, `ONNXModel`. All take BGR.
+Available wrappers: `TorchModel`, `TRTModel`, `OVModel`, `ONNXModel`, `ZeroShotModel`.
+All take BGR.
+
+### Zero-shot, no training
+
+`ZeroShotModel` classifies with class names instead of a trained checkpoint: an open_clip
+dual encoder (SigLIP 2; the image tower is a timm model) scores each crop against one text
+prompt per label. Same contract as `TorchModel`; ids follow `train.label_to_name`,
+normalization comes from the checkpoint. `make infer ARGS="infer.zero_shot=true"` runs it;
+`infer.hub` picks the checkpoint, `infer.template` the prompt.
+
+```python
+from img_clf.infer.zero_shot_model import ZeroShotModel
+
+model = ZeroShotModel(hub="hf-hub:timm/ViT-SO400M-16-SigLIP2-256", labels={0: "car", 1: "bus"})
+model.probs(img, labels=["car", "bus"])   # per-call label sets work too
+```
+
+Needs the `zero_shot` extra (in `[all]`; `transformers` rides along only for the HF
+tokenizer).
 
 ### Batched inference
 

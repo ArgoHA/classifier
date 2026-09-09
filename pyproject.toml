@@ -46,15 +46,17 @@ dependencies = [
 
 [project.optional-dependencies]
 # `make export` / `make bench` backends. Large, so opt-in.
-# onnxruntime-gpu, not onnxruntime: the CPU wheel silently drops the ONNX row in bench
-# to ~20x the GPU latency, which reads as a regression in our code.
+# GPU boxes take onnxruntime-gpu: the CPU wheel silently drops the ONNX row in bench
+# to ~20x the GPU latency, which reads as a regression in our code. There is no GPU
+# wheel for darwin, so mac takes the CPU build and export / the ONNX tests still run.
 # >=1.29 specifically: that is the first CUDA 13 build, so it links the libcublas.so.13 /
 # libcudart.so.13 that torch's cu130 wheels already ship. ORT 1.21 is a cu12 build and
 # needs nvidia-cudnn-cu12, which installs into the same nvidia/cudnn/lib as torch's
 # cu13 cuDNN and overwrites it - that breaks torch outright.
 export = [
     "onnx>=1.21.0,<2",
-    "onnxruntime-gpu>=1.29.0,<1.30",
+    "onnxruntime-gpu>=1.29.0,<1.30; sys_platform == 'linux' or sys_platform == 'win32'",
+    "onnxruntime>=1.29.0,<1.30; sys_platform == 'darwin'",
     "onnxscript>=0.6.2",
     "onnxsim>=0.4.36; sys_platform == 'linux'",
     "openvino>=2025.2.0,<2026",
@@ -63,6 +65,14 @@ export = [
 # Exact on purpose: the [[tool.uv.dependency-metadata]] override that keeps this on cu12
 # is keyed to this version.
 trt = ["tensorrt==10.13.3.9; sys_platform == 'linux'"]
+# Zero-shot inference (img_clf/infer/zero_shot_model.py): open_clip dual encoders.
+# transformers is only here because open_clip resolves an `hf-hub:` tokenizer.
+zero_shot = [
+    "open-clip-torch>=2.31.0",
+    "transformers>=4.46.0",
+]
+# Gradio demo (img_clf/dl/demo.py). Capped: the UI is written against gradio 6 components.
+demo = ["gradio>=6.16.0,<7"]
 # Niche single-script ETL helpers: etl/preprocess.py's PDF and HEIC readers.
 extra = [
     "pypdfium2>=4.30.0",
@@ -72,6 +82,8 @@ all = [
     "img-clf[export]",
     "img-clf[trt]",
     "img-clf[extra]",
+    "img-clf[zero_shot]",
+    "img-clf[demo]",
 ]
 
 [build-system]
