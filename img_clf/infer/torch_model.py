@@ -107,11 +107,23 @@ class TorchModel:
 
     def __call__(
         self, images: Union[np.ndarray, Sequence[np.ndarray]]
-    ) -> List[Dict[str, Union[int, float]]]:
-        """One {"label": class id, "prob": its probability} per image. A lone image gives a
-        one-element list, so callers never branch on what they passed in."""
+    ) -> List[Dict[str, Union[int, float, str, Dict[str, float]]]]:
+        """One {"label": name, "label_id": id, "score": its probability, "probs": full
+        softmax by name} per image - top-1 is the label/score pair, everything past it is
+        the caller's decision. A lone image gives a one-element list, so callers never
+        branch on what they passed in. Names come from label_to_name when the wrapper knows
+        it; classes without a name stringify their id."""
         probabilities = self.probs(images)
-        return [
-            {"label": int(label), "prob": float(probabilities[i, label])}
-            for i, label in enumerate(probabilities.argmax(axis=1))
-        ]
+        names = getattr(self, "label_to_name", None) or {}
+        out = []
+        for row in probabilities:
+            top = int(row.argmax())
+            out.append(
+                {
+                    "label": str(names.get(top, top)),
+                    "label_id": top,
+                    "score": float(row[top]),
+                    "probs": {str(names.get(j, j)): float(p) for j, p in enumerate(row)},
+                }
+            )
+        return out

@@ -216,9 +216,14 @@ def test_single_image_batch_is_probs(reference, backends, sample_images):
         np.testing.assert_array_equal(model.probs([img]), model.probs(img), err_msg=name)
         prediction = model(img)
         assert model([img]) == prediction, name
-        assert len(prediction) == 1 and set(prediction[0]) == {"label", "prob"}, name
-        assert isinstance(prediction[0]["label"], int), name
-        assert isinstance(prediction[0]["prob"], float), name
+        assert len(prediction) == 1, name
+        top = prediction[0]
+        assert set(top) == {"label", "label_id", "score", "probs"}, name
+        assert isinstance(top["label"], str) and isinstance(top["label_id"], int), name
+        assert isinstance(top["score"], float), name
+        assert len(top["probs"]) == model.n_outputs, name
+        assert top["probs"][top["label"]] == top["score"], name
+        assert abs(sum(top["probs"].values()) - 1.0) < 1e-4, name
 
 
 @pytest.mark.slow
@@ -241,8 +246,8 @@ def test_mixed_sizes_in_one_batch(reference, backends, sample_images):
     for name, model in [("torch", reference)] + backends:
         single = np.concatenate([model.probs(img) for img in images])
         _assert_rows_close(name, model.probs(images), single)
-        labels = [pred["label"] for pred in model(images)]
-        assert labels == single.argmax(1).tolist(), name
+        ids = [pred["label_id"] for pred in model(images)]
+        assert ids == single.argmax(1).tolist(), name
 
 
 @pytest.mark.slow

@@ -1,5 +1,10 @@
 """
 Zero-shot classification with an open_clip dual-encoder checkpoint (SigLIP 2 / CLIP).
+
+model examples:
+hf-hub:timm/ViT-SO400M-16-SigLIP2-256
+hf-hub:timm/ViT-B-16-SigLIP2-256
+hf-hub:timm/ViT-B-32-SigLIP2-256
 """
 
 from collections import OrderedDict
@@ -160,11 +165,21 @@ class ZeroShotModel:
 
     def __call__(
         self, images: Union[np.ndarray, Sequence[np.ndarray]]
-    ) -> List[Dict[str, Union[int, float]]]:
-        """One {"label": class id, "prob": its probability} per image - the TorchModel
-        contract. Per-call label sets go through probs()."""
+    ) -> List[Dict[str, Union[int, float, str, Dict[str, float]]]]:
+        """One {"label": name, "label_id": id, "score": its probability, "probs": full
+        softmax by name} per image - top-1 is the label/score pair, everything past it is
+        the caller's decision. Per-call label sets go through probs()."""
         probabilities = self.probs(images)
-        return [
-            {"label": int(label), "prob": float(probabilities[i, label])}
-            for i, label in enumerate(probabilities.argmax(axis=1))
-        ]
+        names = getattr(self, "label_to_name", None) or {}
+        out = []
+        for row in probabilities:
+            top = int(row.argmax())
+            out.append(
+                {
+                    "label": str(names.get(top, top)),
+                    "label_id": top,
+                    "score": float(row[top]),
+                    "probs": {str(names.get(j, j)): float(p) for j, p in enumerate(row)},
+                }
+            )
+        return out

@@ -15,7 +15,7 @@ from img_clf.infer.zero_shot_model import ZeroShotModel
 
 def run_prod_infer(
     model: TorchModel, path_to_data: Path, output_path: Path, label_to_name: Dict[int, str]
-) -> List[int]:
+) -> List[str]:
     preds = []
     img_paths = [
         x for x in Path(path_to_data).glob("*") if x.suffix.lower() in [".jpg", ".jpeg", ".png"]
@@ -23,9 +23,10 @@ def run_prod_infer(
 
     for img_path in tqdm(img_paths):
         img = cv2.imread(str(img_path))  # wrappers take BGR; they do the RGB flip themselves
-        label = model(img)[0]["label"]
-        preds.append(label)
-        save_pred(img_path, label_to_name[label], output_path)
+        pred = model(img)[0]  # {"label": name, "label_id", "score", "probs": full softmax}
+        name = str(label_to_name.get(pred["label_id"], pred["label"]))
+        preds.append(name)
+        save_pred(img_path, name, output_path)
     return preds
 
 

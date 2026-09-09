@@ -103,14 +103,17 @@ def test_labels_are_not_uniform(model):
     assert not np.allclose(probs[0], 0.5, atol=1e-3)
 
 
-def test_call_matches_the_torchmodel_contract(model):
+def test_call_returns_the_full_softmax(model):
+    """The demo-shaped contract: top-1 fields plus every class's probability."""
     img = _images(1)[0]
-    preds = model(img)
-    probs = model.probs(img)
-    assert len(preds) == 1
-    assert isinstance(preds[0]["label"], int)
-    assert preds[0]["label"] == int(probs[0].argmax())
-    assert preds[0]["prob"] == pytest.approx(float(probs[0].max()), abs=1e-6)
+    pred = model(img)[0]
+    row = model.probs(img)[0]
+    assert set(pred) == {"label", "label_id", "score", "probs"}
+    assert pred["label_id"] == int(row.argmax())
+    assert pred["label"] == model.label_names[pred["label_id"]]
+    assert pred["score"] == pytest.approx(float(row.max()), abs=1e-6)
+    assert pred["probs"] == {n: float(p) for n, p in zip(model.label_names, row)}
+    assert abs(sum(pred["probs"].values()) - 1.0) < 1e-4
 
 
 def test_mapping_labels_fix_the_ids(fake_open_clip):

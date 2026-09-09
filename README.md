@@ -80,7 +80,8 @@ only a path:
 from img_clf.infer.trt_model import TRTModel
 
 model = TRTModel(model_path="output/models/exp/model.engine")
-pred = model(cv2.imread("img.jpg"))[0]   # BGR in, as cv2 hands it over; {"label": 3, "prob": 0.97}
+pred = model(cv2.imread("img.jpg"))[0]   # BGR in, as cv2 hands it over
+pred["label"], pred["score"], pred["probs"]  # "excavator", 0.97, and every class's probability
 ```
 
 Bare `state_dict` checkpoints from before the envelope still load: missing facts are
@@ -113,7 +114,7 @@ Every wrapper also classifies a batch - "N crops out of one frame, one forward p
 
 ```python
 probs = model.probs(images)      # (N, C) float32 softmax rows, row i for images[i]
-preds = model(images)            # [{"label": class_id, "prob": its probability}, ...]
+preds = model(images)            # [{"label": name, "label_id", "score", "probs"}, ...]
 model.max_batch_size             # int, or None when the graph has no batch limit
 ```
 
