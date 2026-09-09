@@ -7,13 +7,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from img_clf.config.resolve import CONFIG_NAME, config_dir
 from omegaconf import DictConfig
 from PIL import Image
 from tqdm import tqdm
 
+from img_clf.config.resolve import CONFIG_NAME, config_dir
 from img_clf.dl.ckpt import describe_artifact
-from img_clf.dl.train import prepare_model
+from img_clf.dl.model import prepare_model
 from img_clf.dl.utils import get_latest_experiment_name
 
 

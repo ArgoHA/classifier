@@ -51,7 +51,7 @@ def main(cfg: DictConfig) -> None:
     split = pd.read_csv(csv_path, header=None)
     loader = DataLoader(
         CustomDataset(root_path=data_path, split=split),
-        batch_size=cfg.train.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=cfg.train.num_workers,
     )

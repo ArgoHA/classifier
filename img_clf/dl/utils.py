@@ -1,6 +1,7 @@
 import random
 import subprocess
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
@@ -10,13 +11,16 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.utils.data
 import torch.nn.functional as F
-import wandb
+import torch.utils.data
 from loguru import logger
 from matplotlib import pyplot as plt
+from omegaconf import DictConfig
 from sklearn.metrics import precision_recall_curve
 from tabulate import tabulate
+
+import wandb
+from img_clf.dl.model import build_model
 
 
 def build_precision_recall_threshold_curves(
@@ -333,3 +337,127 @@ def resolve_formats(requested, known, label: str) -> list:
     if unknown:
         raise ValueError(f"unknown {label} {sorted(unknown)}; pick from {list(known)}")
     return requested
+
+
+def auto_batch_size(
+    cfg: DictConfig, num_labels: int, device: str, target_fraction: float = 0.7, default=32
+) -> int:
+    """Largest batch whose training step fits within `target_fraction` of total VRAM.
+
+    Measures rather than estimates: a throwaway copy of the configured model runs a real
+    forward + backward + AdamW step at each candidate size, under the run's AMP dtype and
+    `layers_to_train` freezing, and the caching allocator's peak *reserved* bytes is what
+    gets compared with the budget. Reserved, not allocated, because that is what the GPU
+    is actually out of when training OOMs. The step matters: AdamW's two moment buffers
+    (8 bytes per trainable weight) only appear on the first `optimizer.step()`, so a
+    forward+backward-only probe would never see them. The EMA copy is held for the same
+    reason when `use_ema` is on.
+
+    Escalates through powers of two (1..1024), then binary-searches between the last size
+    that fit and the first that did not. Input is synthetic - a classifier's footprint
+    depends on shape alone - at the largest shape the train collate can emit.
+    """
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        logger.warning(
+            f"Auto batch size probes VRAM, so it only works on CUDA (got {device!r}); "
+            f"using batch_size={default}"
+        )
+        return default
+
+    logger.info("Searching for the optimal batch size...")
+    total_mem = torch.cuda.get_device_properties(dev).total_memory
+    target_mem = int(total_mem * target_fraction)
+    dev_index = dev.index if dev.index is not None else torch.cuda.current_device()
+
+    # fork_rng: timm's random init and the synthetic batches consume the torch RNG, and
+    # the real model built afterwards must init exactly as it would with an explicit
+    # batch_size, or "same seed" stops meaning "same run".
+    with torch.random.fork_rng(devices=[dev_index]):
+        best = _probe_batch_sizes(cfg, num_labels, device, target_mem)
+    torch.cuda.empty_cache()  # the probe's frame is gone; hand its blocks back to CUDA
+
+    total_gb = total_mem / 1024**3
+    if best == 0:
+        logger.warning(
+            f"Even batch_size=1 exceeds {target_fraction:.0%} of {total_gb:.1f} GB VRAM; "
+            "training with 1 and hoping the headroom covers it"
+        )
+        return 1
+    logger.info(
+        f"Optimal batch size: {best} (target {target_fraction:.0%} of {total_gb:.1f} GB VRAM)"
+    )
+    return best
+
+
+def _probe_batch_sizes(cfg: DictConfig, num_labels: int, device: str, target_mem: int) -> int:
+    """The search itself; 0 when not even batch 1 fits.
+
+    Everything it allocates - model, EMA copy, optimizer state, the last probe's graph -
+    is a local of this frame, so it is released as a unit on return.
+    """
+    dev = torch.device(device)
+    h, w = (int(v) for v in cfg.train.img_size)
+    if float(cfg.train.augs.multiscale_prob) > 0:
+        h, w = h + 32, w + 32  # train_collate_fn's upscale is the largest batch it emits
+    amp_enabled = bool(cfg.train.amp_enabled)
+    amp_dtype = torch.float16 if cfg.train.get("amp_dtype") == "float16" else torch.bfloat16
+
+    # Off: `build_model` would announce the frozen groups a second time for the copy.
+    logger.disable("img_clf")
+    try:
+        model = build_model(
+            model_name=cfg.model_name,
+            num_labels=num_labels,
+            pretrained=False,  # weights do not change the footprint, so skip the load
+            device=device,
+            layers_to_train=cfg.train.layers_to_train,
+        )
+    finally:
+        logger.enable("img_clf")
+    model.train()
+    _ema = deepcopy(model) if cfg.train.use_ema else None  # held only for its VRAM
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad])
+    loss_fn = nn.CrossEntropyLoss()
+
+    def fits(bs: int) -> bool:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(dev)
+        try:
+            inputs = torch.randn(bs, 3, h, w, device=dev)
+            labels = torch.randint(0, num_labels, (bs,), device=dev)
+            if amp_enabled:
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    output = model(inputs)
+            else:
+                output = model(inputs)
+            loss_fn(output.float(), labels).backward()
+            # No GradScaler on purpose: a skipped fp16 step would leave the moment buffers
+            # unallocated, and NaN weights cost the same bytes as finite ones.
+            optimizer.step()
+            return torch.cuda.max_memory_reserved(dev) <= target_mem
+        except RuntimeError as e:
+            # cuDNN / cuBLAS raise a plain RuntimeError for a failed workspace alloc.
+            if isinstance(e, torch.OutOfMemoryError) or "out of memory" in str(e).lower():
+                return False
+            raise
+        finally:
+            optimizer.zero_grad(set_to_none=True)
+
+    best, fail = 0, None
+    for bs in (2**i for i in range(0, 11)):  # 1, 2, 4, ... 1024
+        if fits(bs):
+            best = bs
+        else:
+            fail = bs
+            break
+
+    if fail is not None and fail - best > 1:
+        lo, hi = best + 1, fail - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if fits(mid):
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+    return best

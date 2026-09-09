@@ -25,7 +25,7 @@ from torch import nn
 from img_clf.config.resolve import CONFIG_NAME, config_dir
 from img_clf.dl.bench import load_backends
 from img_clf.dl.ckpt import describe_artifact, norm_kwargs
-from img_clf.dl.train import prepare_model
+from img_clf.dl.model import prepare_model
 from img_clf.dl.utils import get_latest_experiment_name, resolve_formats
 
 # Order is the order they build in: OpenVINO and TensorRT both consume the ONNX graph.

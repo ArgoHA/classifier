@@ -38,7 +38,7 @@ train:
   clip_max_norm: 1.0 # gradient clipping
   decision_metrics: [f1] # mean of these picks the best checkpoint
 
-  batch_size: 64 # physical, should fit on the device
+  batch_size: -1 # physical, per step; -1 probes the GPU for the largest that fits in 70% of VRAM
   b_accum_steps: 1 # grad accumulation (n * bs)
   epochs: 15
   label_smoothing: 0.1

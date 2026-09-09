@@ -42,6 +42,9 @@ sanitized template to copy from. Key fields:
 - **train.data_path** — dataset dir, one subfolder per class
 - **train.label_to_name** — class index -> folder name
 - **train.amp_dtype** — `bfloat16` (default) or `float16`
+- **train.batch_size** — physical batch per step; `-1` probes the GPU for the largest batch
+  whose training step (forward, backward, AdamW update) fits in 70% of VRAM. CUDA only,
+  takes a few seconds before the first epoch
 - **train.decision_metrics** — mean of these picks the best checkpoint
 - **export.formats** / **bench.formats** — `null` for all, or a list to restrict
 - **export.max_batch_size** / **export.opt_batch_size** — batch axis of the exported graphs;

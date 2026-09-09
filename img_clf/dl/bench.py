@@ -183,13 +183,19 @@ def main(cfg: DictConfig):
     models_dir = Path(cfg.train.path_to_save)
     validator = Validator(len(cfg.train.label_to_name), cfg.train.label_to_name)
 
+    test_csv = data_path / "test.csv"
+    val_csv = data_path / "val.csv"
+    if not test_csv.is_file() and not val_csv.is_file():
+        raise FileNotFoundError(f"no {test_csv} or {val_csv} under {data_path}")
+    split_path = test_csv if test_csv.is_file() else val_csv
+
     test_dataset = CustomDataset(
         root_path=data_path,
-        split=pd.read_csv(data_path / "test.csv", header=None),
+        split=pd.read_csv(split_path, header=None),
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=cfg.train.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=cfg.train.num_workers,
     )
