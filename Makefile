@@ -1,4 +1,4 @@
-.PHONY: main preprocess split train export bench infer vis check_errors test test-fast build
+.PHONY: main preprocess split train export bench infer vis demo check_errors test test-fast build
 
 # uv run puts the project venv on sys.path; each module has its own Hydra main().
 # Hydra overrides pass straight through: `make train ARGS="model_name=resnet50"`.
@@ -27,6 +27,9 @@ bench:
 
 infer:
 	$(PY).dl.infer $(ARGS)
+
+demo:
+	$(PY).dl.demo $(ARGS)
 
 vis:
 	$(PY).dl.vis $(ARGS)

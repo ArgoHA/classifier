@@ -10,11 +10,12 @@ from tqdm import tqdm
 
 from img_clf.dl.utils import get_latest_experiment_name
 from img_clf.infer.torch_model import TorchModel
+from img_clf.infer.zero_shot_model import ZeroShotModel
 
 
 def run_prod_infer(
     model: TorchModel, path_to_data: Path, output_path: Path, label_to_name: Dict[int, str]
-) -> List[int]:
+) -> List[str]:
     preds = []
     img_paths = [
         x for x in Path(path_to_data).glob("*") if x.suffix.lower() in [".jpg", ".jpeg", ".png"]
@@ -22,9 +23,10 @@ def run_prod_infer(
 
     for img_path in tqdm(img_paths):
         img = cv2.imread(str(img_path))  # wrappers take BGR; they do the RGB flip themselves
-        label = model(img)[0]["label"]
-        preds.append(label)
-        save_pred(img_path, label_to_name[label], output_path)
+        pred = model(img)[0]  # {"label": class id, "class_name", "score", "probs"}
+        name = str(label_to_name.get(pred["label"], pred["class_name"]))
+        preds.append(name)
+        save_pred(img_path, name, output_path)
     return preds
 
 
@@ -36,8 +38,14 @@ def save_pred(img_path, class_name, output_path):
 
 @hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
-    cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
-    model = TorchModel(model_path=str(Path(cfg.train.path_to_save) / "model.pt"))
+    if cfg.infer.zero_shot:
+        # ids line up with label_to_name for run_prod_infer.
+        model = ZeroShotModel(
+            hub=str(cfg.infer.hub), labels=cfg.train.label_to_name, template=str(cfg.infer.template)
+        )
+    else:
+        cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
+        model = TorchModel(model_path=str(Path(cfg.train.path_to_save) / "model.pt"))
 
     output_path = Path(cfg.train.infer_path)
     if output_path.exists():

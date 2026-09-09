@@ -13,6 +13,17 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e_x / e_x.sum(axis=-1, keepdims=True)
 
 
+def _class_names(label_to_name: Optional[Dict[int, str]], n_outputs: int) -> Tuple[str, ...]:
+    """Names in class-id order; an id left unnamed stringifies to its id. The per-class
+    `probs` dict is keyed by these, so two classes sharing a name would silently merge into
+    one entry - rejected here instead."""
+    named = {int(k): str(v) for k, v in (label_to_name or {}).items()}
+    names = tuple(named.get(i, str(i)) for i in range(n_outputs))
+    if len(set(names)) != len(names):
+        raise ValueError(f"class names must be unique, got {names}")
+    return names
+
+
 class TRTModel:
     def __init__(
         self,
@@ -24,8 +35,10 @@ class TRTModel:
         device: Optional[str] = None,
         mean: Sequence[float] = (0.485, 0.456, 0.406),
         std: Sequence[float] = (0.229, 0.224, 0.225),
+        label_to_name: Optional[Dict[int, str]] = None,
     ):
         self.model_path = model_path
+        self.label_to_name = label_to_name
         self.half = half
         self.channels = 3
         self.mean = tuple(mean)
@@ -51,6 +64,7 @@ class TRTModel:
         self.max_batch_size: int = (
             engine_max if max_batch_size is None else min(max_batch_size, engine_max)
         )
+        self.class_names = _class_names(self.label_to_name, self.n_outputs)
 
     def _load_engine(self):
         TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
@@ -173,11 +187,22 @@ class TRTModel:
 
     def __call__(
         self, images: Union[np.ndarray, Sequence[np.ndarray]]
-    ) -> List[Dict[str, Union[int, float]]]:
-        """One {"label": class id, "prob": its probability} per image. A lone image gives a
-        one-element list, so callers never branch on what they passed in."""
+    ) -> List[Dict[str, Union[int, float, str, Dict[str, float]]]]:
+        """One {"label": class id, "class_name": its name, "score": its probability,
+        "probs": full softmax by name} per image - top-1 is the label/score pair, everything
+        past it is the caller's decision. A lone image gives a one-element list, so callers
+        never branch on what they passed in. Names come from label_to_name when the wrapper
+        knows it; classes without a name stringify their id."""
         probabilities = self.probs(images)
-        return [
-            {"label": int(label), "prob": float(probabilities[i, label])}
-            for i, label in enumerate(probabilities.argmax(axis=1))
-        ]
+        out = []
+        for row in probabilities:
+            top = int(row.argmax())
+            out.append(
+                {
+                    "label": top,
+                    "class_name": self.class_names[top],
+                    "score": float(row[top]),
+                    "probs": {name: float(p) for name, p in zip(self.class_names, row)},
+                }
+            )
+        return out

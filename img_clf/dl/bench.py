@@ -161,7 +161,7 @@ def test_model(
             else:
                 prediction = model(image)[0]
 
-            pred_label, max_prob = prediction["label"], prediction["prob"]
+            pred_label, max_prob = prediction["label"], prediction["score"]
             gt_label = int(labels[im_id])
             predictions.append(pred_label)
             gt_labels.append(gt_label)
