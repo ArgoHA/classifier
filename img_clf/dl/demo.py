@@ -6,14 +6,20 @@ Zero-shot scores the upload against comma-separated labels with the config's `in
 checkpoint (downloaded on first use). Finetuned lists the experiment dirs under
 `train.path_to_save` - every model.pt describes itself, so a dropdown entry is all a
 checkpoint needs (a dropped or pasted model.pt works too).
+
+Hydra overrides pass through like every other module: `make demo ARGS="demo.port=8000"`,
+`demo.host=127.0.0.1` to keep the page off the LAN.
 """
 
 import time
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 
 import cv2
 import gradio as gr
+import hydra
+from omegaconf import DictConfig
 
 from img_clf.config.resolve import CONFIG_NAME, config_dir
 from img_clf.infer.torch_model import TorchModel
@@ -27,14 +33,11 @@ HUB_CHOICES = [
 DEFAULT_LABELS = "car, bus, person"
 ZERO_SHOT, FINETUNED = "zero-shot (SigLIP 2)", "finetuned"
 
-_MODELS: dict = {}  # ("zs", hub, template) / ("ft", path) -> wrapper; labels ride in per call
-
-
-def _cfg():
-    from hydra import compose, initialize_config_dir
-
-    with initialize_config_dir(config_dir=str(config_dir()), version_base=None):
-        return compose(config_name=CONFIG_NAME)
+# ("zs", hub, template) / ("ft", path) -> wrapper; labels ride in per call. Bounded and LRU:
+# every distinct key pins a whole model in device memory (a SigLIP 2 encoder is ~1.6 GB) and
+# a prompt edit is a new key, so an unbounded cache OOMs a mid-size card in a few clicks.
+_MODELS: "OrderedDict[tuple, object]" = OrderedDict()
+_MODEL_CACHE_SIZE = 2
 
 
 def list_checkpoints(cfg) -> list:
@@ -62,25 +65,29 @@ def _parse_labels(text: str) -> list:
 
 def _get_model(mode: str, hub: str, template: str, ckpt: str, labels: list, cfg):
     """Zero-shot caches per hub+template (labels ride in per call through the wrapper's own
-    cache), finetuned per checkpoint path - so only the first click pays for a load."""
-    if mode == ZERO_SHOT:
-        key = ("zs", hub, template)
-        if key not in _MODELS:
-            gr.Info(f"Loading {hub.rsplit('/', 1)[-1]} - first use downloads the weights")
-            _MODELS[key] = ZeroShotModel(hub=hub, labels=labels, template=template)
+    cache), finetuned per checkpoint path - so only the first click pays for a load. Past
+    `_MODEL_CACHE_SIZE` models the least recently used one is dropped."""
+    key = ("zs", hub, template) if mode == ZERO_SHOT else ("ft", str(_resolve_ckpt(ckpt, cfg)))
+    if key in _MODELS:
+        _MODELS.move_to_end(key)
         return _MODELS[key]
-    key = ("ft", str(_resolve_ckpt(ckpt, cfg)))
-    if key not in _MODELS:
+
+    if key[0] == "zs":
+        gr.Info(f"Loading {hub.rsplit('/', 1)[-1]} - first use downloads the weights")
+        _MODELS[key] = ZeroShotModel(hub=hub, labels=labels, template=template)
+    else:
         _MODELS[key] = TorchModel(model_path=key[1])
+    while len(_MODELS) > _MODEL_CACHE_SIZE:
+        _MODELS.popitem(last=False)  # freed back to torch's allocator for the next load
     return _MODELS[key]
 
 
-def classify(img, mode: str, hub: str, labels_text: str, template: str, ckpt: str):
+def classify(cfg, img, mode: str, hub: str, labels_text: str, template: str, ckpt: str):
     """One upload -> {class: prob} for gr.Label, plus a status line."""
     if img is None:
         raise gr.Error("Upload an image first")
     labels = _parse_labels(labels_text) if mode == ZERO_SHOT else None
-    model = _get_model(mode, hub, template, ckpt, labels, _cfg())
+    model = _get_model(mode, hub, template, ckpt, labels, cfg)
 
     img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # wrappers take BGR
     t0 = time.perf_counter()
@@ -91,15 +98,13 @@ def classify(img, mode: str, hub: str, labels_text: str, template: str, ckpt: st
     if labels:  # zero-shot: the columns follow the requested labels, not the load-time ones
         source, scores = hub.rsplit("/", 1)[-1], dict(zip(labels, map(float, probs[0])))
     else:
-        names = model.label_to_name or {}
         source = Path(model.model_path).parent.name
-        scores = {names.get(i, str(i)): float(p) for i, p in enumerate(probs[0])}
+        scores = {name: float(p) for name, p in zip(model.class_names, probs[0])}
     status = f"✅ {type(model).__name__} | {source} | device: {model.device} | {ms:.1f} ms"
     return scores, status
 
 
-def build_ui() -> gr.Blocks:
-    cfg = _cfg()
+def build_ui(cfg: DictConfig) -> gr.Blocks:
     with gr.Blocks(title="img-clf demo") as demo:
         gr.Markdown(
             "# Image classifier demo\nSigLIP 2 zero-shot by default; switch to finetuned to "
@@ -110,7 +115,8 @@ def build_ui() -> gr.Blocks:
                 mode = gr.Radio([ZERO_SHOT, FINETUNED], value=ZERO_SHOT, label="Model")
                 hub = gr.Dropdown(
                     HUB_CHOICES, value=cfg.infer.hub, label="Zero-shot checkpoint",
-                    info="first use downloads the weights",
+                    info="first use downloads the weights; any other hf-hub: ref works too",
+                    allow_custom_value=True,  # infer.hub is free-form, the list is a shortlist
                 )
                 labels = gr.Textbox(
                     DEFAULT_LABELS, label="Labels",
@@ -139,14 +145,19 @@ def build_ui() -> gr.Blocks:
             zs = name == ZERO_SHOT
             return [gr.update(visible=zs)] * 3 + [gr.update(visible=not zs)] * 2
 
+        def on_run(*inputs):  # cfg rides in from the closure, composed once by main()
+            return classify(cfg, *inputs)
+
         mode.change(toggle, mode, [hub, labels, template, ckpt, ckpt_file])
-        run.click(classify, [img, mode, hub, labels, template, ckpt], [out, status])
+        run.click(on_run, [img, mode, hub, labels, template, ckpt], [out, status])
     return demo
 
 
-def main(host: str = "0.0.0.0", port: int = 7860, share: bool = False) -> None:
+@hydra.main(version_base=None, config_path=config_dir(), config_name=CONFIG_NAME)
+def main(cfg: DictConfig) -> None:
     # gradio 6.16 trips this inside its own queue route, once per request
     warnings.filterwarnings("ignore", "'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated")
+    host, port = str(cfg.demo.host), int(cfg.demo.port)
     if host not in ("127.0.0.1", "localhost"):
         # the checkpoint field loads any model.pt the browser names - LAN access hands
         # that file-loading power to everyone who can reach the port
@@ -157,7 +168,7 @@ def main(host: str = "0.0.0.0", port: int = 7860, share: bool = False) -> None:
     # 0.0.0.0 is a bind address, not a thing a browser can open.
     click = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     print(f"Open http://{click}:{port} in your browser")
-    build_ui().launch(server_name=host, server_port=port, share=share)
+    build_ui(cfg).launch(server_name=host, server_port=port, share=bool(cfg.demo.share))
 
 
 if __name__ == "__main__":

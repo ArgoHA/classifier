@@ -81,8 +81,15 @@ from img_clf.infer.trt_model import TRTModel
 
 model = TRTModel(model_path="output/models/exp/model.engine")
 pred = model(cv2.imread("img.jpg"))[0]   # BGR in, as cv2 hands it over
-pred["label"], pred["score"], pred["probs"]  # "excavator", 0.97, and every class's probability
+pred["label"], pred["score"]             # 3, 0.97 - the class id and its probability
+pred["class_name"], pred["probs"]        # its name, and every class's probability by name
 ```
+
+`label` is always the class id; `class_name` and the `probs` keys are names when the
+wrapper knows them. `TorchModel` reads `label_to_name` out of the envelope, so it names
+classes on its own. The graph wrappers stay self-contained - they never import the
+checkpoint code - so they take `label_to_name={0: "excavator", ...}` from whoever builds
+them, and stringify the id for classes left unnamed.
 
 Bare `state_dict` checkpoints from before the envelope still load: missing facts are
 recovered from the `config.yaml` that training freezes next to the weights.
@@ -94,8 +101,9 @@ All take BGR.
 
 `ZeroShotModel` classifies with class names instead of a trained checkpoint: an open_clip
 dual encoder (SigLIP 2; the image tower is a timm model) scores each crop against one text
-prompt per label. Same contract as `TorchModel`; ids follow `train.label_to_name`,
-normalization comes from the checkpoint. `make infer ARGS="infer.zero_shot=true"` runs it;
+prompt per label. Same contract as `TorchModel`; ids follow `train.label_to_name`, while
+normalization and resize mode come from the checkpoint - swapping `infer.hub` swaps the
+preprocessing with it (SigLIP 2 squashes, CLIP scales the short edge and center-crops). `make infer ARGS="infer.zero_shot=true"` runs it;
 `infer.hub` picks the checkpoint, `infer.template` the prompt.
 
 ```python
@@ -114,7 +122,7 @@ Every wrapper also classifies a batch - "N crops out of one frame, one forward p
 
 ```python
 probs = model.probs(images)      # (N, C) float32 softmax rows, row i for images[i]
-preds = model(images)            # [{"label": name, "label_id", "score", "probs"}, ...]
+preds = model(images)            # [{"label": class_id, "class_name", "score", "probs"}, ...]
 model.max_batch_size             # int, or None when the graph has no batch limit
 ```
 

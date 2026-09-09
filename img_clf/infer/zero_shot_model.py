@@ -1,6 +1,9 @@
 """
 Zero-shot classification with an open_clip dual-encoder checkpoint (SigLIP 2 / CLIP).
 
+Preprocessing follows the checkpoint's own cfg, resize_mode included: SigLIP 2 squashes,
+CLIP scales the short edge and center-crops. Swapping the hub swaps both.
+
 model examples:
 hf-hub:timm/ViT-SO400M-16-SigLIP2-256
 hf-hub:timm/ViT-B-16-SigLIP2-256
@@ -18,10 +21,15 @@ import torch
 DEFAULT_TEMPLATE = "a photo of a {label}."
 
 _INTERPOLATION = {"bicubic": cv2.INTER_CUBIC, "bilinear": cv2.INTER_LINEAR}
+_RESIZE_MODES = ("shortest", "squash", "longest")
 
 
 def _label_to_name(labels: Union[Sequence[str], Mapping[int, str]]) -> Dict[int, str]:
     """Sequence or label_to_name mapping (DictConfig included) -> {id: name}, ids 0..N-1."""
+    if isinstance(labels, str):
+        # a str is a Sequence[str] of characters: "cat" would pass every check below as
+        # three one-letter classes
+        raise ValueError(f"labels must be a sequence or mapping of names, got the str {labels!r}")
     if hasattr(labels, "items"):
         items = {int(k): str(v) for k, v in labels.items()}
         if sorted(items) != list(range(len(items))):
@@ -65,8 +73,8 @@ class ZeroShotModel:
         # No graph-side limit, like TorchModel: the nn.Module takes any batch.
         self.max_batch_size: Optional[int] = max_batch_size
         self.label_to_name = _label_to_name(labels)
-        self.label_names = tuple(self.label_to_name[i] for i in range(len(self.label_to_name)))
-        self.n_outputs = len(self.label_names)
+        self.class_names = tuple(self.label_to_name[i] for i in range(len(self.label_to_name)))
+        self.n_outputs = len(self.class_names)
         self._cache_size = cache_size
         self._text_cache: "OrderedDict[Tuple[str, ...], torch.Tensor]" = OrderedDict()
 
@@ -89,6 +97,7 @@ class ZeroShotModel:
         if self.half and not self.device.startswith("cuda"):
             self.model.half()
         self.model.eval()
+        self.model.to(self.device)
         if not hasattr(self.model, "logit_scale"):
             raise ValueError(f"{self.hub} has no logit_scale - not a zero-shot dual encoder")
         with torch.no_grad():
@@ -102,6 +111,10 @@ class ZeroShotModel:
         self.mean = tuple(cfg.get("mean") or (0.5, 0.5, 0.5))
         self.std = tuple(cfg.get("std") or (0.5, 0.5, 0.5))
         self._interp = _INTERPOLATION.get(str(cfg.get("interpolation", "bicubic")), cv2.INTER_CUBIC)
+        self.resize_mode = str(cfg.get("resize_mode") or "shortest")  # open_clip's own default
+        if self.resize_mode not in _RESIZE_MODES:
+            raise ValueError(f"{self.hub} has an unknown resize_mode {self.resize_mode!r}")
+        self._fill_color = int(cfg.get("fill_color") or 0)
 
     def _test_pred(self) -> None:
         """One forward through both towers: bad installs fail at construction; warms the
@@ -109,12 +122,30 @@ class ZeroShotModel:
         blank = np.zeros((*self.input_size, 3), dtype=np.uint8)
         self.probs(blank)
 
+    def _resize(self, image: np.ndarray) -> np.ndarray:
+        """The checkpoint's own resize_mode, mirroring open_clip's inference transform:
+        'squash' distorts to the target, 'shortest' scales the short edge and center-crops
+        the overflow, 'longest' scales the long edge and center-pads with fill_color."""
+        h, w = self.input_size
+        if self.resize_mode == "squash":
+            return cv2.resize(image, (w, h), interpolation=self._interp)  # cv2 takes (w, h)
+        ih, iw = image.shape[:2]
+        edge = max if self.resize_mode == "shortest" else min
+        scale = edge(h / ih, w / iw)
+        rh, rw = max(1, round(ih * scale)), max(1, round(iw * scale))
+        img = cv2.resize(image, (rw, rh), interpolation=self._interp)
+        if self.resize_mode == "shortest":  # the long edge overflows, cut it off the middle
+            top, left = (rh - h) // 2, (rw - w) // 2
+            return img[top : top + h, left : left + w]
+        out = np.full((h, w, image.shape[2]), self._fill_color, dtype=img.dtype)
+        top, left = (h - rh) // 2, (w - rw) // 2
+        out[top : top + rh, left : left + rw] = img
+        return out
+
     def _preprocess(self, image: np.ndarray) -> torch.Tensor:
-        """BGR HWC uint8 -> normalized NCHW tensor; interpolation, size and stats from the
-        checkpoint's own cfg, not the finetune convention."""
-        img = cv2.resize(
-            image, (self.input_size[1], self.input_size[0]), interpolation=self._interp
-        )  # cv2 takes (w, h)
+        """BGR HWC uint8 -> normalized NCHW tensor; interpolation, geometry and stats from
+        the checkpoint's own cfg, not the finetune convention."""
+        img = self._resize(image)
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR->RGB, HWC->CHW
         img = np.ascontiguousarray(img).astype(np.float32) / 255.0
         mean = np.asarray(self.mean, dtype=np.float32)[:, None, None]
@@ -150,7 +181,7 @@ class ZeroShotModel:
             images = [images]
         if len(images) == 0:
             raise ValueError("probs() needs at least one image")
-        names = self.label_names if labels is None else tuple(_label_to_name(labels).values())
+        names = self.class_names if labels is None else tuple(_label_to_name(labels).values())
         text = self._text_features(names)
         step = self.max_batch_size or len(images)
         rows = []
@@ -166,20 +197,19 @@ class ZeroShotModel:
     def __call__(
         self, images: Union[np.ndarray, Sequence[np.ndarray]]
     ) -> List[Dict[str, Union[int, float, str, Dict[str, float]]]]:
-        """One {"label": name, "label_id": id, "score": its probability, "probs": full
-        softmax by name} per image - top-1 is the label/score pair, everything past it is
-        the caller's decision. Per-call label sets go through probs()."""
+        """One {"label": class id, "class_name": its name, "score": its probability,
+        "probs": full softmax by name} per image - top-1 is the label/score pair, everything
+        past it is the caller's decision. Per-call label sets go through probs()."""
         probabilities = self.probs(images)
-        names = getattr(self, "label_to_name", None) or {}
         out = []
         for row in probabilities:
             top = int(row.argmax())
             out.append(
                 {
-                    "label": str(names.get(top, top)),
-                    "label_id": top,
+                    "label": top,
+                    "class_name": self.class_names[top],
                     "score": float(row[top]),
-                    "probs": {str(names.get(j, j)): float(p) for j, p in enumerate(row)},
+                    "probs": {name: float(p) for name, p in zip(self.class_names, row)},
                 }
             )
         return out

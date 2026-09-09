@@ -91,6 +91,11 @@ infer:
   hub: hf-hub:timm/ViT-SO400M-16-SigLIP2-256 # open_clip checkpoint (image tower: a timm model)
   template: "a photo of a {label}." # prompt wrapped around every label from train.label_to_name
 
+demo:
+  host: "0.0.0.0" # reachable from the LAN; "127.0.0.1" keeps the page on this machine
+  port: 7860
+  share: false # gradio's public tunnel
+
 check_errors:
   split: test # which split `make check_errors` walks
 

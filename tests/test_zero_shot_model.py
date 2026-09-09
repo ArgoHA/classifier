@@ -13,6 +13,8 @@ import torch
 
 from img_clf.infer.zero_shot_model import DEFAULT_TEMPLATE, ZeroShotModel
 
+open_clip = pytest.importorskip("open_clip")  # the zero_shot extra is opt-in
+
 
 class FakeDualEncoder(torch.nn.Module):
     """Enough open_clip for the wrapper: logit_scale, encode_image/encode_text with
@@ -46,9 +48,15 @@ def _fake_tokenize(texts):
 @pytest.fixture
 def fake_open_clip(monkeypatch):
     """The wrapper does `import open_clip` inside _load_model - patch the module itself."""
-    import open_clip
-
-    cfg = {"size": 32, "mean": (0.5, 0.5, 0.5), "std": (0.5, 0.5, 0.5), "interpolation": "bicubic"}
+    cfg = {
+        "size": 32,
+        "mean": (0.5, 0.5, 0.5),
+        "std": (0.5, 0.5, 0.5),
+        "interpolation": "bicubic",
+        "resize_mode": "squash",  # SigLIP's; anything else is rejected
+    }
+    # Deliberately built on the CPU whatever device= says - real open_clip honors it, a
+    # wrapper around it need not, and placing the model is the wrapper's job.
     monkeypatch.setattr(
         open_clip,
         "create_model_and_transforms",
@@ -108,24 +116,24 @@ def test_call_returns_the_full_softmax(model):
     img = _images(1)[0]
     pred = model(img)[0]
     row = model.probs(img)[0]
-    assert set(pred) == {"label", "label_id", "score", "probs"}
-    assert pred["label_id"] == int(row.argmax())
-    assert pred["label"] == model.label_names[pred["label_id"]]
+    assert set(pred) == {"label", "class_name", "score", "probs"}
+    assert pred["label"] == int(row.argmax())
+    assert pred["class_name"] == model.class_names[pred["label"]]
     assert pred["score"] == pytest.approx(float(row.max()), abs=1e-6)
-    assert pred["probs"] == {n: float(p) for n, p in zip(model.label_names, row)}
+    assert pred["probs"] == {n: float(p) for n, p in zip(model.class_names, row)}
     assert abs(sum(pred["probs"].values()) - 1.0) < 1e-4
 
 
 def test_mapping_labels_fix_the_ids(fake_open_clip):
     model = _model(labels={1: "cat", 0: "dog"})
     assert model.label_to_name == {0: "dog", 1: "cat"}
-    assert model.label_names == ("dog", "cat")
+    assert model.class_names == ("dog", "cat")
     assert model.n_outputs == 2
 
 
 def test_string_keys_in_a_mapping_are_normalized(fake_open_clip):
     model = _model(labels={"0": "cat", "1": "dog"})
-    assert model.label_names == ("cat", "dog")
+    assert model.class_names == ("cat", "dog")
 
 
 def test_text_is_encoded_at_construction_and_cached(model):
@@ -150,6 +158,37 @@ def test_cache_is_bounded(fake_open_clip):
     assert model.model.text_calls == 5
 
 
+def test_the_model_lands_on_the_wrapper_device(model):
+    """device= reached create_model_and_transforms, but the fake ignored it - as a wrapped
+    or stubbed builder may. Without the wrapper's own .to(), every forward mismatches."""
+    assert {p.device.type for p in model.model.parameters()} == {model.device.split(":")[0]}
+
+
+def _with_resize_mode(monkeypatch, mode):
+    """Rebuild the fake checkpoint's cfg with another resize_mode - swapping the hub is a
+    one-line config change, and a CLIP hub brings its own preprocessing along."""
+    cfg = {"size": 32, "mean": (0.5, 0.5, 0.5), "std": (0.5, 0.5, 0.5), "resize_mode": mode}
+    monkeypatch.setattr(open_clip, "get_model_preprocess_cfg", lambda model: cfg)
+    return _model()
+
+
+@pytest.mark.parametrize("mode, pads", [("squash", False), ("shortest", False), ("longest", True)])
+def test_resize_mode_follows_the_checkpoint(fake_open_clip, monkeypatch, mode, pads):
+    """SigLIP squashes, CLIP scales the short edge and center-crops - always squashing feeds
+    a CLIP checkpoint a differently preprocessed image than its weights were trained on."""
+    model = _with_resize_mode(monkeypatch, mode)
+    assert model.resize_mode == mode
+    resized = model._resize(np.full((20, 60, 3), 200, dtype=np.uint8))  # 3:1, crop != pad
+    assert resized.shape == (32, 32, 3)
+    assert bool((resized == 0).any()) is pads  # fill_color shows only where it padded
+
+
+def test_an_unknown_resize_mode_is_rejected(fake_open_clip, monkeypatch):
+    """Better than falling through to whichever branch happens to be last."""
+    with pytest.raises(ValueError, match="resize_mode"):
+        _with_resize_mode(monkeypatch, "letterbox")
+
+
 def test_the_checkpoint_describes_the_preprocessing(model):
     assert model.input_size == (32, 32)
     assert model.mean == (0.5, 0.5, 0.5) and model.std == (0.5, 0.5, 0.5)
@@ -171,6 +210,9 @@ def test_guards(model):
         _model(labels=["only"])
     with pytest.raises(ValueError, match="unique"):
         _model(labels=["cat", "cat"])
+    # a str is a Sequence[str] of characters: "cat" would otherwise be three classes
+    with pytest.raises(ValueError, match="got the str"):
+        _model(labels="cat")
 
 
 def test_template_must_carry_the_label_slot():

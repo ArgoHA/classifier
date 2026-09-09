@@ -13,6 +13,17 @@ def softmax(x: NDArray) -> NDArray:
     return e_x / e_x.sum(axis=-1, keepdims=True)
 
 
+def _class_names(label_to_name: Optional[Dict[int, str]], n_outputs: int) -> Tuple[str, ...]:
+    """Names in class-id order; an id left unnamed stringifies to its id. The per-class
+    `probs` dict is keyed by these, so two classes sharing a name would silently merge into
+    one entry - rejected here instead."""
+    named = {int(k): str(v) for k, v in (label_to_name or {}).items()}
+    names = tuple(named.get(i, str(i)) for i in range(n_outputs))
+    if len(set(names)) != len(names):
+        raise ValueError(f"class names must be unique, got {names}")
+    return names
+
+
 class ONNXModel:
     def __init__(
         self,
@@ -45,6 +56,7 @@ class ONNXModel:
         # i.e. the batch axis is free and any N runs in one session call.
         limits = [n for n in (graph_batch, max_batch_size) if n is not None]
         self.max_batch_size: Optional[int] = min(limits) if limits else None
+        self.class_names = _class_names(self.label_to_name, self.n_outputs)
         self._test_pred()
 
     def _load_model(self):
@@ -125,22 +137,21 @@ class ONNXModel:
     def __call__(
         self, images: Union[np.ndarray, Sequence[np.ndarray]]
     ) -> List[Dict[str, Union[int, float, str, Dict[str, float]]]]:
-        """One {"label": name, "label_id": id, "score": its probability, "probs": full
-        softmax by name} per image - top-1 is the label/score pair, everything past it is
-        the caller's decision. A lone image gives a one-element list, so callers never
-        branch on what they passed in. Names come from label_to_name when the wrapper knows
-        it; classes without a name stringify their id."""
+        """One {"label": class id, "class_name": its name, "score": its probability,
+        "probs": full softmax by name} per image - top-1 is the label/score pair, everything
+        past it is the caller's decision. A lone image gives a one-element list, so callers
+        never branch on what they passed in. Names come from label_to_name when the wrapper
+        knows it; classes without a name stringify their id."""
         probabilities = self.probs(images)
-        names = getattr(self, "label_to_name", None) or {}
         out = []
         for row in probabilities:
             top = int(row.argmax())
             out.append(
                 {
-                    "label": str(names.get(top, top)),
-                    "label_id": top,
+                    "label": top,
+                    "class_name": self.class_names[top],
                     "score": float(row[top]),
-                    "probs": {str(names.get(j, j)): float(p) for j, p in enumerate(row)},
+                    "probs": {name: float(p) for name, p in zip(self.class_names, row)},
                 }
             )
         return out

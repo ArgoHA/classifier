@@ -218,11 +218,11 @@ def test_single_image_batch_is_probs(reference, backends, sample_images):
         assert model([img]) == prediction, name
         assert len(prediction) == 1, name
         top = prediction[0]
-        assert set(top) == {"label", "label_id", "score", "probs"}, name
-        assert isinstance(top["label"], str) and isinstance(top["label_id"], int), name
+        assert set(top) == {"label", "class_name", "score", "probs"}, name
+        assert isinstance(top["label"], int) and isinstance(top["class_name"], str), name
         assert isinstance(top["score"], float), name
         assert len(top["probs"]) == model.n_outputs, name
-        assert top["probs"][top["label"]] == top["score"], name
+        assert top["probs"][top["class_name"]] == top["score"], name
         assert abs(sum(top["probs"].values()) - 1.0) < 1e-4, name
 
 
@@ -246,7 +246,7 @@ def test_mixed_sizes_in_one_batch(reference, backends, sample_images):
     for name, model in [("torch", reference)] + backends:
         single = np.concatenate([model.probs(img) for img in images])
         _assert_rows_close(name, model.probs(images), single)
-        ids = [pred["label_id"] for pred in model(images)]
+        ids = [pred["label"] for pred in model(images)]
         assert ids == single.argmax(1).tolist(), name
 
 
