@@ -5,7 +5,7 @@
 Zero-shot scores the upload against comma-separated labels with the config's `infer.hub`
 checkpoint (downloaded on first use). Finetuned lists the experiment dirs under
 `train.path_to_save` - every model.pt describes itself, so a dropdown entry is all a
-checkpoint needs (a pasted path to any model.pt works too).
+checkpoint needs (a dropped or pasted model.pt works too).
 """
 
 import time
@@ -119,9 +119,13 @@ def build_ui() -> gr.Blocks:
                 template = gr.Textbox(cfg.infer.template, label="Prompt template")
                 ckpt = gr.Dropdown(
                     list_checkpoints(cfg), label="Finetuned checkpoint",
-                    info=f"experiments under {Path(cfg.train.path_to_save).parent}; paste a "
-                    "model.pt path for anything else",
+                    info=f"experiments under {Path(cfg.train.path_to_save).parent}; drop or "
+                    "paste a model.pt for anything else",
                     allow_custom_value=True, visible=False,
+                )
+                ckpt_file = gr.File(
+                    label="…or drop model.pt here", file_types=[".pt"], type="filepath",
+                    visible=False,
                 )
                 img = gr.Image(sources=["upload", "webcam"], type="numpy", label="Image")
                 run = gr.Button("Run", variant="primary")
@@ -129,11 +133,13 @@ def build_ui() -> gr.Blocks:
                 out = gr.Label(label="Probabilities", num_top_classes=10)
                 status = gr.Markdown()
 
+        ckpt_file.change(lambda p: p or "", inputs=ckpt_file, outputs=ckpt)
+
         def toggle(name: str):
             zs = name == ZERO_SHOT
-            return [gr.update(visible=zs)] * 3 + [gr.update(visible=not zs)]
+            return [gr.update(visible=zs)] * 3 + [gr.update(visible=not zs)] * 2
 
-        mode.change(toggle, mode, [hub, labels, template, ckpt])
+        mode.change(toggle, mode, [hub, labels, template, ckpt, ckpt_file])
         run.click(classify, [img, mode, hub, labels, template, ckpt], [out, status])
     return demo
 
